@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -283,7 +285,19 @@ func (m oauthTabModel) Update(msg tea.Msg) (oauthTabModel, tea.Cmd) {
 func (m oauthTabModel) startOAuth(provider oauthProvider, generation int) tea.Cmd {
 	return func() tea.Msg {
 		// Call the auth URL endpoint with is_webui=true
-		data, err := m.client.getJSON("/v0/management/" + provider.apiPath + "?is_webui=true")
+		apiPath := "/v0/management/" + provider.apiPath + "?is_webui=true"
+		if provider.apiPath == "commandcode-auth-url" {
+			// Command Code requires a localhost callback baked into the auth URL.
+			callback := strings.TrimSpace(m.callbackInput.Value())
+			if callback == "" {
+				callback = strings.TrimSpace(os.Getenv("COMMANDCODE_CALLBACK_URL"))
+			}
+			if callback == "" {
+				callback = "http://127.0.0.1:8317/callback"
+			}
+			apiPath += "&callback=" + url.QueryEscape(callback)
+		}
+		data, err := m.client.getJSON(apiPath)
 		if err != nil {
 			return oauthStartMsg{generation: generation, err: fmt.Errorf("failed to start %s login: %w", provider.name, err)}
 		}

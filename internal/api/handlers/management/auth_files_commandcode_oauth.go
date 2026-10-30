@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,9 +30,8 @@ type CommandCodeCallbackPayload struct {
 	ErrorDesc string `json:"error_description,omitempty"`
 }
 
-// commandCodeCallbackURL builds the loopback callback used by studio/auth/cli.
-// Command Code studio only accepts http://127.0.0.1:<port>/callback (or localhost);
-// paths like /commandcode/callback are rejected as "回调网址无效".
+// commandCodeCallbackURL builds the default loopback callback used by studio/auth/cli.
+// Command Code studio only accepts http://127.0.0.1:<port>/callback (or localhost).
 func (h *Handler) commandCodeCallbackURL() (string, error) {
 	cfg := h.configSnapshot()
 	if h == nil || cfg == nil || cfg.Port <= 0 {
@@ -39,13 +40,79 @@ func (h *Handler) commandCodeCallbackURL() (string, error) {
 	return fmt.Sprintf("http://127.0.0.1:%d/callback", cfg.Port), nil
 }
 
+// validateCommandCodeCallbackURL ensures the callback is a Command Code–accepted loopback URL.
+func validateCommandCodeCallbackURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", fmt.Errorf("callback is required")
+	}
+	u, errParse := url.Parse(raw)
+	if errParse != nil {
+		return "", fmt.Errorf("invalid callback URL")
+	}
+	if !strings.EqualFold(u.Scheme, "http") {
+		return "", fmt.Errorf("callback must use http://localhost or http://127.0.0.1")
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host != "127.0.0.1" && host != "localhost" {
+		return "", fmt.Errorf("callback host must be localhost or 127.0.0.1")
+	}
+	port := u.Port()
+	if port != "" {
+		if _, errPort := net.LookupPort("tcp", port); errPort != nil {
+			return "", fmt.Errorf("invalid callback port")
+		}
+	}
+	path := u.EscapedPath()
+	if path == "" || path == "/" {
+		path = "/callback"
+	}
+	if path != "/callback" {
+		return "", fmt.Errorf("callback path must be /callback")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("callback must not include query or fragment")
+	}
+	if port != "" {
+		return fmt.Sprintf("http://%s:%s/callback", host, port), nil
+	}
+	return fmt.Sprintf("http://%s/callback", host), nil
+}
+
+func commandCodeCallbackOverride(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	for _, key := range []string{"callback", "redirect_uri", "redirect_url"} {
+		if v := strings.TrimSpace(c.Query(key)); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(os.Getenv("COMMANDCODE_CALLBACK_URL"))
+}
+
 // RequestCommandCodeToken starts Command Code browser OAuth for Management / TUI.
+// Optional query: callback / redirect_uri / redirect_url (must be http://127.0.0.1|localhost[:port]/callback).
 func (h *Handler) RequestCommandCodeToken(c *gin.Context) {
-	callbackURL, errCallback := h.commandCodeCallbackURL()
+	defaultCallback, errCallback := h.commandCodeCallbackURL()
 	if errCallback != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 		return
 	}
+	rawCallback := commandCodeCallbackOverride(c)
+	if rawCallback == "" {
+		rawCallback = defaultCallback
+	}
+	callbackURL, errValidate := validateCommandCodeCallbackURL(rawCallback)
+	if errValidate != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":            errValidate.Error(),
+			"default_callback": defaultCallback,
+			"hint":             "Use a localhost loopback URL, e.g. http://127.0.0.1:8317/callback (SSH tunnel: use the local forwarded port).",
+		})
+		return
+	}
+
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
@@ -67,7 +134,12 @@ func (h *Handler) RequestCommandCodeToken(c *gin.Context) {
 		authDir = cfg.AuthDir
 	}
 	go h.completeCommandCodeOAuth(ctx, authDir, state)
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ok",
+		"url":      authURL,
+		"state":    state,
+		"callback": callbackURL,
+	})
 }
 
 func (h *Handler) completeCommandCodeOAuth(ctx context.Context, authDir, state string) {

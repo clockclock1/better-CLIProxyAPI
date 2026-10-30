@@ -63,7 +63,7 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 	i18nInserts := [][2]string{
 		{
 			"devin_oauth_title:`Devin OAuth`",
-			"devin_oauth_title:`Devin OAuth`,commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`开始 Command Code 登录`,commandcode_oauth_hint:`通过浏览器 OAuth 登录 Command Code，自动保存 API Key。`",
+			"devin_oauth_title:`Devin OAuth`,commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`开始 Command Code 登录`,commandcode_oauth_hint:`点击后填写 localhost 回调地址（如 http://127.0.0.1:8317/callback），再浏览器登录。远程请先 SSH 端口转发。`",
 		},
 		{
 			`"devin_oauth_title":"Devin OAuth"`,
@@ -71,7 +71,7 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 		},
 		{
 			"devin_oauth_title:`Devin OAuth`,devin_oauth_button:`Start Devin Login`",
-			"devin_oauth_title:`Devin OAuth`,commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`Start Command Code Login`,commandcode_oauth_hint:`Sign in to Command Code through browser OAuth to save an API key.`,devin_oauth_button:`Start Devin Login`",
+			"devin_oauth_title:`Devin OAuth`,commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`Start Command Code Login`,commandcode_oauth_hint:`You will be asked for a localhost callback (e.g. http://127.0.0.1:8317/callback). Use an SSH tunnel when the proxy is remote.`,devin_oauth_button:`Start Devin Login`",
 		},
 	}
 	for _, pair := range i18nInserts {
@@ -83,9 +83,16 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 		out = strings.Replace(
 			out,
 			"devin_oauth_button:`Start Devin Login`",
-			"commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`Start Command Code Login`,commandcode_oauth_hint:`Sign in to Command Code through browser OAuth to save an API key.`,devin_oauth_button:`Start Devin Login`",
+			"commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`Start Command Code Login`,commandcode_oauth_hint:`You will be asked for a localhost callback (e.g. http://127.0.0.1:8317/callback). Use an SSH tunnel when the proxy is remote.`,devin_oauth_button:`Start Devin Login`",
 			1,
 		)
+	}
+
+	// Prompt for localhost callback before starting Command Code OAuth (remote/SSH tunnel).
+	startAuthOld := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
+	startAuthNew := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(r.callback=(prompt(`填写 Command Code localhost 回调地址（SSH 隧道请填本机转发端口）`,`http://127.0.0.1:`+(location.port||`8317`)+`/callback`)||``).trim(),r.callback?W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}}):Promise.reject(new Error(`callback required`))):W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
+	if strings.Contains(out, startAuthOld) && !strings.Contains(out, "n===`commandcode`?(r.callback=") {
+		out = strings.Replace(out, startAuthOld, startAuthNew, 1)
 	}
 
 	return []byte(out)

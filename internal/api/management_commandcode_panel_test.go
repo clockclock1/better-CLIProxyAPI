@@ -56,6 +56,17 @@ func TestPatchManagementHTMLForCommandCode(t *testing.T) {
 	}
 }
 
+func TestPatchManagementHTMLInjectsCallbackPrompt(t *testing.T) {
+	raw := []byte("startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}")
+	out := string(patchManagementHTMLForCommandCode(raw))
+	if !strings.Contains(out, "n===`commandcode`?(r.callback=") {
+		t.Fatalf("missing commandcode callback prompt patch:\n%s", out)
+	}
+	if !strings.Contains(out, "填写 Command Code localhost 回调地址") {
+		t.Fatal("missing Chinese prompt text")
+	}
+}
+
 func TestPatchManagementHTMLAgainstLiveSnippet(t *testing.T) {
 	// Exact live CPAMC fragment observed on 186.241.81.108 (v0.1.1 panel asset).
 	raw := []byte(`{kind:` + "`builtin`" + `,id:` + "`xai`" + `,label:` + "`xAI`" + `,titleKey:` + "`auth_login.xai_oauth_title`" + `,icon:{light:Ax,dark:jx},flow:` + "`browser`" + `},{kind:` + "`builtin`" + `,id:` + "`devin`" + `,label:` + "`Devin`" + `,titleKey:` + "`auth_login.devin_oauth_title`" + `,icon:{light:xx,dark:Sx},flow:` + "`browser`" + `}],ire=new Set(VM.map(e=>e.id)),are=new Set([` + "`codex`" + `,` + "`anthropic`" + `,` + "`antigravity`" + `,` + "`xai`" + `,` + "`devin`" + `])`)
