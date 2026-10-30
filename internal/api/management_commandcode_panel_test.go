@@ -41,8 +41,8 @@ func TestPatchManagementHTMLForCommandCode(t *testing.T) {
 				"titleKey:`auth_login.commandcode_oauth_title`",
 				"[`codex`,`anthropic`,`antigravity`,`xai`,`devin`,`commandcode`]",
 				"[`codex`,`claude`,`antigravity`,`xai`,`devin`,`commandcode`]",
-				"commandcode_oauth_title",
-				"commandcode_oauth_button:`Start Command Code Login`",
+				"commandcode_oauth_title:`Command Code API Key`",
+				"commandcode_oauth_button:`Enter API Key`",
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("patched HTML missing %q\n%s", want, out)
@@ -66,14 +66,20 @@ func TestPatchManagementHTMLInjectsAPIKeyImport(t *testing.T) {
 	if !strings.Contains(out, "oauth/import?provider=commandcode") {
 		t.Fatalf("missing commandcode API key import patch:\n%s", out)
 	}
-	if !strings.Contains(out, "粘贴 Command Code API Key") {
-		t.Fatal("missing Chinese API key prompt text")
+	if !strings.Contains(out, "Command Code API Key") {
+		t.Fatal("missing API key prompt text")
 	}
-	if !strings.Contains(out, "commandcode_oauth_status_error:`Command Code 认证失败：`") {
+	if strings.Contains(out, "浏览器登录请留空") || strings.Contains(out, "r.callback=") {
+		t.Fatal("browser OAuth path should be removed from startAuth")
+	}
+	if !strings.Contains(out, "commandcode_oauth_status_error:`Command Code 保存失败：`") {
 		t.Fatal("missing zh status error i18n")
 	}
-	if !strings.Contains(out, "commandcode_oauth_button:`Start Command Code Login`") {
+	if !strings.Contains(out, "commandcode_oauth_button:`Enter API Key`") {
 		t.Fatal("missing en button i18n")
+	}
+	if !strings.Contains(out, "commandcode_oauth_button:`填写 API Key`") {
+		t.Fatal("missing zh button i18n")
 	}
 }
 

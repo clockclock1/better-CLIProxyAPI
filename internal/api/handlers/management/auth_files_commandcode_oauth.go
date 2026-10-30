@@ -118,10 +118,22 @@ func (h *Handler) ImportCommandCodeAPIKey(c *gin.Context) {
 		apiBase = commandcodeauth.DefaultAPIBaseURL
 	}
 	keyName := strings.TrimSpace(firstNonEmpty(body.KeyName, c.Query("key_name"), "manual"))
+	userID := strings.TrimSpace(firstNonEmpty(body.UserID, c.Query("user_id")))
+	userName := strings.TrimSpace(firstNonEmpty(body.UserName, c.Query("user_name")))
+	if userID == "" || userName == "" {
+		if resolvedID, resolvedName := h.lookupCommandCodeIdentity(c, apiKey, apiBase); resolvedID != "" || resolvedName != "" {
+			if userID == "" {
+				userID = resolvedID
+			}
+			if userName == "" {
+				userName = resolvedName
+			}
+		}
+	}
 	record, errRecord := commandcodeauth.CreateAuthRecord(&commandcodeauth.CallbackPayload{
 		APIKey:   apiKey,
-		UserID:   strings.TrimSpace(firstNonEmpty(body.UserID, c.Query("user_id"))),
-		UserName: strings.TrimSpace(firstNonEmpty(body.UserName, c.Query("user_name"))),
+		UserID:   userID,
+		UserName: userName,
 		KeyName:  keyName,
 	}, apiBase)
 	if errRecord != nil {

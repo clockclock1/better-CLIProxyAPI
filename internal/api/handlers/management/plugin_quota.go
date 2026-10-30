@@ -42,18 +42,31 @@ func (r credentialQuotaRequest) resolveAuthIndex() string {
 
 // GetQuotaProviders returns the list of registered quota providers.
 func (h *Handler) GetQuotaProviders(c *gin.Context) {
+	builtin := []gin.H{{
+		"plugin_id":           "builtin-commandcode",
+		"provider":            "commandcode",
+		"display_name":        "Command Code",
+		"supported_providers": []string{"commandcode"},
+		"supports_reset":      false,
+	}}
 	if h == nil {
-		c.JSON(http.StatusOK, gin.H{"providers": []any{}})
+		c.JSON(http.StatusOK, gin.H{"providers": builtin})
 		return
 	}
 	h.mu.Lock()
 	host := h.pluginHost
 	h.mu.Unlock()
 	if host == nil {
-		c.JSON(http.StatusOK, gin.H{"providers": []any{}})
+		c.JSON(http.StatusOK, gin.H{"providers": builtin})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"providers": host.QuotaProviders(c.Request.Context())})
+	providers := host.QuotaProviders(c.Request.Context())
+	out := make([]any, 0, len(providers)+1)
+	out = append(out, builtin[0])
+	for _, p := range providers {
+		out = append(out, p)
+	}
+	c.JSON(http.StatusOK, gin.H{"providers": out})
 }
 
 // FetchCredentialQuota retrieves normalized quota for a credential via its quota provider or declarative probe.
@@ -127,6 +140,18 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 				}
 			}
 		}
+	}
+
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "commandcode") ||
+		strings.EqualFold(strings.TrimSpace(provider), "commandcode") {
+		quotaResp, errCC := h.fetchCommandCodeQuota(c, auth)
+		if errCC != nil {
+			log.WithError(errCC).Warnf("failed to fetch Command Code quota for credential %s", auth.Index)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errCC)})
+			return
+		}
+		c.JSON(http.StatusOK, quotaResp)
+		return
 	}
 
 	c.JSON(http.StatusNotImplemented, gin.H{"error": "no quota provider available for credential"})

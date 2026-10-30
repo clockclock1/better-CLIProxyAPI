@@ -700,6 +700,10 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 			entry["quota_probe"] = probe
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "commandcode") {
+		entry["supports_quota"] = true
+		entry["quota_provider"] = "commandcode"
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}

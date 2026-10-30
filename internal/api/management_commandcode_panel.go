@@ -63,6 +63,7 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 					iconPart = devinCard[idx+1 : end]
 				}
 			}
+			// Reuse browser-card plumbing; startAuth is patched to API-key-only (no OAuth jump).
 			commandCard := "{kind:`builtin`,id:`commandcode`,label:`Command Code`,titleKey:`auth_login.commandcode_oauth_title`," +
 				iconPart + ",flow:`browser`}"
 			out = out[:loc[1]] + "," + commandCard + out[loc[1]:]
@@ -80,14 +81,14 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 	}
 
 	devinFilter := "{id:`devin`,label:`Devin`,patterns:[]}"
-	commandFilter := "{id:`commandcode`,label:`Command Code`,patterns:[/command[-_]?code/i,/poolside\\//i,/reflection\\//i,/glyph-cluster/i]}"
+	commandFilter := "{id:`commandcode`,label:`Command Code`,patterns:[/command[-_]?code/i,/poolside\\//i,/reflection\\//i,/glyph-cluster/i,/claude-/i,/gpt-/i,/deepseek\\//i,/moonshotai\\//i,/z-ai\\//i,/zai-org\\//i,/minimax\\//i,/MiniMaxAI\\//i,/ornith\\//i,/xiaomi\\//i,/Qwen\\//i,/meituan\\//i,/stepfun\\//i,/tencent\\//i,/google\\/gemini/i,/sakana\\//i,/nvidia\\//i,/thinkingmachines\\//i,/inclusionai\\//i,/meta\\/muse/i,/xai\\/grok/i,/mistral\\//i]}"
 	if strings.Contains(out, devinFilter) && !strings.Contains(out, "{id:`commandcode`,label:`Command Code`") {
 		out = strings.Replace(out, devinFilter, commandFilter+","+devinFilter, 1)
 	}
 
-	zhKeys := "commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`开始 Command Code 登录`,commandcode_oauth_hint:`远程请粘贴 API Key。浏览器登录回调本机且无查询参数。`,commandcode_oauth_status_waiting:`等待 Command Code 认证中...`,commandcode_oauth_status_success:`Command Code 认证成功！`,commandcode_oauth_status_error:`Command Code 认证失败：`,commandcode_oauth_start_error:`启动 Command Code 登录失败：`,commandcode_open_link:`打开链接`,commandcode_copy_link:`复制链接`"
-	enKeys := "commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`Start Command Code Login`,commandcode_oauth_hint:`Paste an API key on remote hosts. Browser login callbacks to localhost with no query string.`,commandcode_oauth_status_waiting:`Waiting for Command Code authentication...`,commandcode_oauth_status_success:`Command Code authentication successful!`,commandcode_oauth_status_error:`Command Code authentication failed: `,commandcode_oauth_start_error:`Failed to start Command Code login: `,commandcode_open_link:`Open link`,commandcode_copy_link:`Copy link`"
-	twKeys := `"commandcode_oauth_title":"Command Code OAuth","commandcode_oauth_button":"開始 Command Code 登入","commandcode_oauth_hint":"遠端請貼上 API Key。","commandcode_oauth_status_waiting":"等待 Command Code 認證中...","commandcode_oauth_status_success":"Command Code 認證成功！","commandcode_oauth_status_error":"Command Code 認證失敗：","commandcode_oauth_start_error":"啟動 Command Code 登入失敗：","commandcode_open_link":"開啟連結","commandcode_copy_link":"複製連結"`
+	zhKeys := "commandcode_oauth_title:`Command Code API Key`,commandcode_oauth_button:`填写 API Key`,commandcode_oauth_hint:`粘贴 Command Code API Key 即可（https://commandcode.ai 或本机 ~/.commandcode/auth.json 的 apiKey）。无需浏览器授权跳转。`,commandcode_oauth_status_waiting:`正在保存 Command Code API Key...`,commandcode_oauth_status_success:`Command Code API Key 已保存！`,commandcode_oauth_status_error:`Command Code 保存失败：`,commandcode_oauth_start_error:`保存 Command Code API Key 失败：`,commandcode_open_link:`打开链接`,commandcode_copy_link:`复制链接`"
+	enKeys := "commandcode_oauth_title:`Command Code API Key`,commandcode_oauth_button:`Enter API Key`,commandcode_oauth_hint:`Paste a Command Code API key (from https://commandcode.ai or ~/.commandcode/auth.json). No browser OAuth redirect.`,commandcode_oauth_status_waiting:`Saving Command Code API key...`,commandcode_oauth_status_success:`Command Code API key saved!`,commandcode_oauth_status_error:`Failed to save Command Code API key: `,commandcode_oauth_start_error:`Failed to save Command Code API key: `,commandcode_open_link:`Open link`,commandcode_copy_link:`Copy link`"
+	twKeys := `"commandcode_oauth_title":"Command Code API Key","commandcode_oauth_button":"填寫 API Key","commandcode_oauth_hint":"貼上 Command Code API Key 即可，無需瀏覽器授權跳轉。","commandcode_oauth_status_waiting":"正在儲存 Command Code API Key...","commandcode_oauth_status_success":"Command Code API Key 已儲存！","commandcode_oauth_status_error":"Command Code 儲存失敗：","commandcode_oauth_start_error":"儲存 Command Code API Key 失敗：","commandcode_open_link":"開啟連結","commandcode_copy_link":"複製連結"`
 
 	out = injectOnceIfMissing(
 		out,
@@ -108,17 +109,25 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 		"commandcode_oauth_title",
 	)
 	// Fallback: English title alone already partially patched in older builds.
-	if strings.Contains(out, "devin_oauth_button:`Start Devin Login`") && !strings.Contains(out, "commandcode_oauth_button:`Start Command Code Login`") {
+	if strings.Contains(out, "devin_oauth_button:`Start Devin Login`") && !strings.Contains(out, "commandcode_oauth_button:`Enter API Key`") {
 		out = strings.Replace(out, "devin_oauth_button:`Start Devin Login`", enKeys+",devin_oauth_button:`Start Devin Login`", 1)
 	}
-	if strings.Contains(out, "devin_oauth_button:`开始 Devin 登录`") && !strings.Contains(out, "commandcode_oauth_button:`开始 Command Code 登录`") {
+	if strings.Contains(out, "devin_oauth_button:`开始 Devin 登录`") && !strings.Contains(out, "commandcode_oauth_button:`填写 API Key`") {
 		out = strings.Replace(out, "devin_oauth_button:`开始 Devin 登录`", zhKeys+",devin_oauth_button:`开始 Devin 登录`", 1)
 	}
 
+	// API-key only: never start browser OAuth from the management panel.
 	startAuthOld := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
-	startAuthNew := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(()=>{let k=(prompt(`粘贴 Command Code API Key（远程推荐）\\n可从本机 ~/.commandcode/auth.json 的 apiKey 复制\\n\\n浏览器登录请留空（必须已 SSH 端口转发）`,``)||``).trim();return k?W.post(`/oauth/import?provider=commandcode`,{api_key:k}):(r.callback=(prompt(`浏览器登录：localhost 回调地址`,`http://127.0.0.1:`+(location.port||`8317`)+`/callback`)||``).trim(),r.callback?W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}}):Promise.reject(new Error(`cancelled`)))})():W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
+	startAuthNew := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(()=>{let k=(prompt(`Command Code API Key\\n从 https://commandcode.ai 或本机 ~/.commandcode/auth.json 的 apiKey 复制`,``)||``).trim();return k?W.post(`/oauth/import?provider=commandcode`,{api_key:k}):Promise.reject(new Error(`api_key required`))})():W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
 	if strings.Contains(out, startAuthOld) && !strings.Contains(out, "oauth/import?provider=commandcode") {
 		out = strings.Replace(out, startAuthOld, startAuthNew, 1)
+	}
+	// Upgrade older dual-path patch (API key OR browser callback) to API-key only.
+	if strings.Contains(out, "浏览器登录请留空") {
+		oldDual := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(()=>{let k=(prompt(`粘贴 Command Code API Key（远程推荐）\\n可从本机 ~/.commandcode/auth.json 的 apiKey 复制\\n\\n浏览器登录请留空（必须已 SSH 端口转发）`,``)||``).trim();return k?W.post(`/oauth/import?provider=commandcode`,{api_key:k}):(r.callback=(prompt(`浏览器登录：localhost 回调地址`,`http://127.0.0.1:`+(location.port||`8317`)+`/callback`)||``).trim(),r.callback?W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}}):Promise.reject(new Error(`cancelled`)))})():W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
+		if strings.Contains(out, oldDual) {
+			out = strings.Replace(out, oldDual, startAuthNew, 1)
+		}
 	}
 
 	return []byte(out)

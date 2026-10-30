@@ -96,8 +96,8 @@ func TestGetQuotaProviders_Endpoint(t *testing.T) {
 		t.Fatalf("failed to decode json: %v", errUnmarshal)
 	}
 	providers, ok := emptyResp["providers"].([]any)
-	if !ok || len(providers) != 0 {
-		t.Fatalf("expected 0 providers, got %#v", emptyResp)
+	if !ok || len(providers) != 1 {
+		t.Fatalf("expected builtin commandcode provider, got %#v", emptyResp)
 	}
 
 	// Case 2: With quota plugin
@@ -123,8 +123,8 @@ func TestGetQuotaProviders_Endpoint(t *testing.T) {
 		t.Fatalf("failed to decode json: %v", errUnmarshal)
 	}
 	providers2, ok2 := populatedResp["providers"].([]any)
-	if !ok2 || len(providers2) != 1 {
-		t.Fatalf("expected 1 provider, got %#v", populatedResp)
+	if !ok2 || len(providers2) != 2 {
+		t.Fatalf("expected builtin + plugin providers, got %#v", populatedResp)
 	}
 }
 
