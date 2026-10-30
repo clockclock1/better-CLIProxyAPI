@@ -63,7 +63,7 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 	i18nInserts := [][2]string{
 		{
 			"devin_oauth_title:`Devin OAuth`",
-			"devin_oauth_title:`Devin OAuth`,commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`开始 Command Code 登录`,commandcode_oauth_hint:`点击后填写 localhost 回调地址（如 http://127.0.0.1:8317/callback），再浏览器登录。远程请先 SSH 端口转发。`",
+			"devin_oauth_title:`Devin OAuth`,commandcode_oauth_title:`Command Code OAuth`,commandcode_oauth_button:`开始 Command Code 登录`,commandcode_oauth_hint:`远程请直接粘贴 API Key。浏览器登录会回调 127.0.0.1（无查询参数），必须先 SSH 端口转发，否则会连接被拒绝。`",
 		},
 		{
 			`"devin_oauth_title":"Devin OAuth"`,
@@ -88,10 +88,11 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 		)
 	}
 
-	// Prompt for localhost callback before starting Command Code OAuth (remote/SSH tunnel).
+	// Command Code: prefer pasting API key (remote-safe). Browser OAuth needs a live
+	// localhost listener because studio POSTs apiKey to the callback (URL has no query).
 	startAuthOld := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
-	startAuthNew := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(r.callback=(prompt(`填写 Command Code localhost 回调地址（SSH 隧道请填本机转发端口）`,`http://127.0.0.1:`+(location.port||`8317`)+`/callback`)||``).trim(),r.callback?W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}}):Promise.reject(new Error(`callback required`))):W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
-	if strings.Contains(out, startAuthOld) && !strings.Contains(out, "n===`commandcode`?(r.callback=") {
+	startAuthNew := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(()=>{let k=(prompt(`推荐：粘贴 Command Code API Key（远程服务器请用这个）\\n来源：本机 ~/.commandcode/auth.json 的 apiKey，或 commandcode.ai\\n\\n若坚持浏览器登录请留空（须先 SSH -L 把端口转到本机，否则会 127.0.0.1 连接被拒绝且地址栏无参数）`,``)||``).trim();return k?W.post(`/oauth/import?provider=commandcode`,{api_key:k}):(r.callback=(prompt(`浏览器登录：填写 localhost 回调（须已 SSH 端口转发）`,`http://127.0.0.1:`+(location.port||`8317`)+`/callback`)||``).trim(),r.callback?W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}}):Promise.reject(new Error(`cancelled`)))})():W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
+	if strings.Contains(out, startAuthOld) && !strings.Contains(out, "oauth/import?provider=commandcode") {
 		out = strings.Replace(out, startAuthOld, startAuthNew, 1)
 	}
 

@@ -56,14 +56,14 @@ func TestPatchManagementHTMLForCommandCode(t *testing.T) {
 	}
 }
 
-func TestPatchManagementHTMLInjectsCallbackPrompt(t *testing.T) {
+func TestPatchManagementHTMLInjectsAPIKeyImport(t *testing.T) {
 	raw := []byte("startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}")
 	out := string(patchManagementHTMLForCommandCode(raw))
-	if !strings.Contains(out, "n===`commandcode`?(r.callback=") {
-		t.Fatalf("missing commandcode callback prompt patch:\n%s", out)
+	if !strings.Contains(out, "oauth/import?provider=commandcode") {
+		t.Fatalf("missing commandcode API key import patch:\n%s", out)
 	}
-	if !strings.Contains(out, "填写 Command Code localhost 回调地址") {
-		t.Fatal("missing Chinese prompt text")
+	if !strings.Contains(out, "粘贴 Command Code API Key") {
+		t.Fatal("missing Chinese API key prompt text")
 	}
 }
 

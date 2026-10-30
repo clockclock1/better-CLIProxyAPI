@@ -197,6 +197,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/devin-auth-url", s.mgmt.RequestDevinToken)
 		mgmt.GET("/meta-auth-url", s.mgmt.RequestMetaToken)
 		mgmt.GET("/commandcode-auth-url", s.mgmt.RequestCommandCodeToken)
+		mgmt.POST("/commandcode-import", s.mgmt.ImportCommandCodeAPIKey)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 		mgmt.DELETE("/oauth-session", s.mgmt.CancelAuthSession)
 	}

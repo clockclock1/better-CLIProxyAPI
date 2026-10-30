@@ -91,6 +91,57 @@ func commandCodeCallbackOverride(c *gin.Context) string {
 	return strings.TrimSpace(os.Getenv("COMMANDCODE_CALLBACK_URL"))
 }
 
+// ImportCommandCodeAPIKey saves a manually provided Command Code API key.
+// Remote deployments should prefer this: studio posts credentials to localhost,
+// so a browser on another machine cannot complete the loopback callback.
+func (h *Handler) ImportCommandCodeAPIKey(c *gin.Context) {
+	var body struct {
+		APIKey   string `json:"api_key"`
+		APIKeyAlt string `json:"apiKey"`
+		UserID   string `json:"user_id"`
+		UserName string `json:"user_name"`
+		KeyName  string `json:"key_name"`
+	}
+	if c.Request != nil && c.Request.Body != nil {
+		_ = c.ShouldBindJSON(&body)
+	}
+	apiKey := strings.TrimSpace(firstNonEmpty(body.APIKey, body.APIKeyAlt, c.Query("api_key"), c.Query("apiKey")))
+	if apiKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "api_key is required",
+			"hint":  "Paste the apiKey from https://commandcode.ai or from ~/.commandcode/auth.json on a machine that already ran cmdc login.",
+		})
+		return
+	}
+	apiBase := strings.TrimSpace(os.Getenv("COMMANDCODE_API_URL"))
+	if apiBase == "" {
+		apiBase = commandcodeauth.DefaultAPIBaseURL
+	}
+	keyName := strings.TrimSpace(firstNonEmpty(body.KeyName, c.Query("key_name"), "manual"))
+	record, errRecord := commandcodeauth.CreateAuthRecord(&commandcodeauth.CallbackPayload{
+		APIKey:   apiKey,
+		UserID:   strings.TrimSpace(firstNonEmpty(body.UserID, c.Query("user_id"))),
+		UserName: strings.TrimSpace(firstNonEmpty(body.UserName, c.Query("user_name"))),
+		KeyName:  keyName,
+	}, apiBase)
+	if errRecord != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": errRecord.Error()})
+		return
+	}
+	ctx := PopulateAuthContext(context.Background(), c)
+	savedPath, errSave := h.saveTokenRecord(ctx, record)
+	if errSave != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save authentication tokens"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ok",
+		"path":     savedPath,
+		"filename": record.FileName,
+		"label":    record.Label,
+	})
+}
+
 // RequestCommandCodeToken starts Command Code browser OAuth for Management / TUI.
 // Optional query: callback / redirect_uri / redirect_url (must be http://127.0.0.1|localhost[:port]/callback).
 func (h *Handler) RequestCommandCodeToken(c *gin.Context) {
