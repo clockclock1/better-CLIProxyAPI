@@ -1,0 +1,212 @@
+package management
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	commandcodeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/commandcode"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	log "github.com/sirupsen/logrus"
+)
+
+// CommandCodeCallbackPayload is the studio/auth/cli redirect or POST body.
+type CommandCodeCallbackPayload struct {
+	APIKey    string `json:"apiKey"`
+	State     string `json:"state"`
+	UserID    string `json:"userId"`
+	UserName  string `json:"userName"`
+	KeyName   string `json:"keyName"`
+	Error     string `json:"error"`
+	ErrorDesc string `json:"error_description,omitempty"`
+}
+
+// commandCodeCallbackURL builds the loopback callback used by studio/auth/cli.
+func (h *Handler) commandCodeCallbackURL() (string, error) {
+	cfg := h.configSnapshot()
+	if h == nil || cfg == nil || cfg.Port <= 0 {
+		return "", fmt.Errorf("server port is not configured")
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d/commandcode/callback", cfg.Port), nil
+}
+
+// RequestCommandCodeToken starts Command Code browser OAuth for Management / TUI.
+func (h *Handler) RequestCommandCodeToken(c *gin.Context) {
+	callbackURL, errCallback := h.commandCodeCallbackURL()
+	if errCallback != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
+		return
+	}
+	state, errState := misc.GenerateRandomState()
+	if errState != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
+		return
+	}
+
+	sessionProxyURL := oauthSessionProxyURLFromContext(c)
+	cfg := h.oauthConfigWithProxy(sessionProxyURL)
+	studioBase := strings.TrimSpace(os.Getenv("COMMANDCODE_STUDIO_URL"))
+	if studioBase == "" {
+		studioBase = commandcodeauth.DefaultStudioBaseURL
+	}
+	authURL := commandcodeauth.BuildAuthURL(studioBase, callbackURL, state, "cli")
+	RegisterOAuthSessionWithProxy(state, "commandcode", sessionProxyURL)
+
+	ctx := PopulateAuthContext(context.Background(), c)
+	authDir := ""
+	if cfg != nil {
+		authDir = cfg.AuthDir
+	}
+	go h.completeCommandCodeOAuth(ctx, authDir, state)
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func (h *Handler) completeCommandCodeOAuth(ctx context.Context, authDir, state string) {
+	sessionProxyURL := GetOAuthSessionProxyURL(state)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	go watchOAuthSessionCancel(ctx, cancel, state, "commandcode")
+
+	waitFile := filepath.Join(authDir, fmt.Sprintf(".oauth-commandcode-%s.oauth", state))
+	defer func() {
+		if errRemove := os.Remove(waitFile); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			log.Warn("failed to remove Command Code OAuth callback file")
+		}
+	}()
+
+	result, errWait := waitCommandCodeOAuthCallback(ctx, waitFile, state)
+	if errWait != nil {
+		if IsOAuthSessionPending(state, "commandcode") {
+			SetOAuthSessionError(state, errWait.Error())
+		}
+		return
+	}
+	if !IsOAuthSessionPending(state, "commandcode") {
+		return
+	}
+	if result.State != state {
+		SetOAuthSessionError(state, "State code error")
+		return
+	}
+	if result.Error != "" {
+		msg := result.Error
+		if result.ErrorDesc != "" {
+			msg = result.ErrorDesc
+		}
+		SetOAuthSessionError(state, msg)
+		return
+	}
+	if strings.TrimSpace(result.APIKey) == "" {
+		SetOAuthSessionError(state, "Missing API key from Command Code callback")
+		return
+	}
+
+	apiBase := strings.TrimSpace(os.Getenv("COMMANDCODE_API_URL"))
+	if apiBase == "" {
+		apiBase = commandcodeauth.DefaultAPIBaseURL
+	}
+	record, errRecord := commandcodeauth.CreateAuthRecord(&commandcodeauth.CallbackPayload{
+		APIKey:   result.APIKey,
+		State:    result.State,
+		UserID:   result.UserID,
+		UserName: result.UserName,
+		KeyName:  result.KeyName,
+	}, apiBase)
+	if errRecord != nil {
+		if IsOAuthSessionPending(state, "commandcode") {
+			SetOAuthSessionError(state, "Failed to create Command Code authentication record")
+		}
+		return
+	}
+	applySessionProxyToAuthRecord(record, sessionProxyURL)
+	if errGuard := claimOAuthSessionCommit(state, "commandcode"); errGuard != nil {
+		return
+	}
+	if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
+		FailOAuthSessionCommit(state, "Failed to save authentication tokens")
+		return
+	}
+	CompleteOAuthSession(state)
+	log.Info("Command Code authentication successful")
+}
+
+func waitCommandCodeOAuthCallback(ctx context.Context, path, state string) (*CommandCodeCallbackPayload, error) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if !IsOAuthSessionPending(state, "commandcode") {
+			return nil, errOAuthSessionNotPending
+		}
+		if ctx.Err() != nil {
+			return nil, errors.New("Timeout waiting for OAuth callback")
+		}
+		data, errRead := os.ReadFile(path)
+		if errRead == nil {
+			var result CommandCodeCallbackPayload
+			if errDecode := json.Unmarshal(data, &result); errDecode != nil {
+				return nil, errors.New("Invalid OAuth callback")
+			}
+			return &result, nil
+		}
+		if !errors.Is(errRead, os.ErrNotExist) {
+			return nil, errors.New("Failed to read OAuth callback")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, errors.New("Timeout waiting for OAuth callback")
+		case <-ticker.C:
+		}
+	}
+}
+
+// WriteCommandCodeOAuthCallbackFile persists a studio/auth/cli callback for a pending session.
+func WriteCommandCodeOAuthCallbackFile(authDir, state string, payload *CommandCodeCallbackPayload) (string, error) {
+	if payload == nil {
+		return "", fmt.Errorf("callback payload is nil")
+	}
+	if err := ValidateOAuthState(state); err != nil {
+		return "", err
+	}
+	if !IsOAuthSessionPending(state, "commandcode") {
+		return "", errOAuthSessionNotPending
+	}
+	if strings.TrimSpace(authDir) == "" {
+		return "", fmt.Errorf("auth dir is empty")
+	}
+	payload.State = strings.TrimSpace(state)
+	fileName := fmt.Sprintf(".oauth-commandcode-%s.oauth", state)
+	filePath := filepath.Join(authDir, fileName)
+	if err := os.MkdirAll(authDir, 0o700); err != nil {
+		return "", fmt.Errorf("create oauth callback dir: %w", err)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
+	}
+	tmp, errCreate := os.CreateTemp(authDir, ".oauth-callback-*")
+	if errCreate != nil {
+		return "", fmt.Errorf("create oauth callback file: %w", errCreate)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if _, errWrite := tmp.Write(data); errWrite != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("write oauth callback file: %w", errWrite)
+	}
+	if errClose := tmp.Close(); errClose != nil {
+		return "", fmt.Errorf("close oauth callback file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpPath, filePath); errRename != nil {
+		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
+	}
+	return filePath, nil
+}

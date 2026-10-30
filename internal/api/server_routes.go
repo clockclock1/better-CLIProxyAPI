@@ -203,8 +203,55 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	})
 
+	commandCodeCallbackHandler := func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		state := strings.TrimSpace(c.Query("state"))
+		errStr := strings.TrimSpace(c.Query("error"))
+		if errStr == "" {
+			errStr = strings.TrimSpace(c.Query("error_description"))
+		}
+		payload := &managementHandlers.CommandCodeCallbackPayload{
+			APIKey:    strings.TrimSpace(c.Query("apiKey")),
+			State:     state,
+			UserID:    strings.TrimSpace(c.Query("userId")),
+			UserName:  strings.TrimSpace(c.Query("userName")),
+			KeyName:   strings.TrimSpace(c.Query("keyName")),
+			Error:     errStr,
+			ErrorDesc: strings.TrimSpace(c.Query("error_description")),
+		}
+		if payload.APIKey == "" && errStr == "" {
+			// Studio may POST JSON to /callback
+			if c.Request.Method == http.MethodPost {
+				_ = c.ShouldBindJSON(payload)
+				if payload.State == "" {
+					payload.State = state
+				}
+			}
+		}
+		if payload.APIKey == "" && payload.Error == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "apiKey or error is required"})
+			return
+		}
+		cfg := s.getConfig()
+		authDir := ""
+		if cfg != nil {
+			authDir = cfg.AuthDir
+		}
+		if _, errWrite := managementHandlers.WriteCommandCodeOAuthCallbackFile(authDir, payload.State, payload); errWrite != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
+			return
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	}
+
 	devinCallbackHandler := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
+		// Command Code studio/auth/cli may land on /callback with apiKey=...
+		if strings.TrimSpace(c.Query("apiKey")) != "" || strings.TrimSpace(c.Query("userId")) != "" {
+			commandCodeCallbackHandler(c)
+			return
+		}
 		code := strings.TrimSpace(c.Query("code"))
 		state := strings.TrimSpace(c.Query("state"))
 		errStr := strings.TrimSpace(c.Query("error"))
@@ -229,7 +276,10 @@ func (s *Server) setupRoutes() {
 	}
 
 	s.engine.GET("/callback", devinCallbackHandler)
+	s.engine.POST("/callback", commandCodeCallbackHandler)
 	s.engine.GET("/devin/callback", devinCallbackHandler)
+	s.engine.GET("/commandcode/callback", commandCodeCallbackHandler)
+	s.engine.POST("/commandcode/callback", commandCodeCallbackHandler)
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
