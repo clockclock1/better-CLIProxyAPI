@@ -261,13 +261,14 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 	}
 
 	// Prefer rolling window limits (5h / weekly / monthly) — CPAMC renders these as
-	// the segmented "usage limits" columns. Credit pills are secondary.
+	// the segmented usage-limit columns. Credit pills are secondary.
 	buckets := make([]pluginapi.QuotaBucket, 0, 3)
 	if credits.WindowLimits != nil {
-		if b, ok := commandCodeWindowToBucket("five_hour", credits.WindowLimits.FiveHour); ok {
+		// DisplayName is shown as the column title in management UI (not i18n'd for plugins).
+		if b, ok := commandCodeWindowToBucket("five_hour", "五小时限额", "五小时限额", credits.WindowLimits.FiveHour); ok {
 			buckets = append(buckets, b)
 		}
-		if b, ok := commandCodeWindowToBucket("weekly", credits.WindowLimits.Weekly); ok {
+		if b, ok := commandCodeWindowToBucket("weekly", "周限额", "周限额", credits.WindowLimits.Weekly); ok {
 			buckets = append(buckets, b)
 		}
 	}
@@ -282,14 +283,15 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 		}
 		buckets = append(buckets, pluginapi.QuotaBucket{
 			Window:            "monthly",
+			DisplayName:       "月限额",
 			RemainingFraction: remaining / planTotal,
 			ResetTime:         periodEnd,
-			Description:       fmt.Sprintf("%.1f / %.0f monthly credits remaining", remaining, planTotal),
+			Description:       fmt.Sprintf("月限额：剩余 %.1f / %.0f credits", remaining, planTotal),
 		})
 	}
 	if len(buckets) > 0 {
 		resp.Groups = []pluginapi.QuotaGroup{{
-			DisplayName: "Usage limits",
+			DisplayName: "额度限额",
 			Buckets:     buckets,
 		}}
 	} else if totalRemaining > 0 || purchased > 0 || free > 0 {
@@ -297,8 +299,9 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 			DisplayName: "Credits",
 			Buckets: []pluginapi.QuotaBucket{{
 				Window:            "balance",
+				DisplayName:       "余额",
 				RemainingFraction: 1,
-				Description:       fmt.Sprintf("%.1f credits remaining", totalRemaining),
+				Description:       fmt.Sprintf("余额：剩余 %.1f credits", totalRemaining),
 			}},
 		}}
 	}
@@ -327,7 +330,7 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 	return resp, nil
 }
 
-func commandCodeWindowToBucket(window string, src *commandCodeWindowBucket) (pluginapi.QuotaBucket, bool) {
+func commandCodeWindowToBucket(window, displayName, labelCN string, src *commandCodeWindowBucket) (pluginapi.QuotaBucket, bool) {
 	if src == nil || src.Cap <= 0 {
 		return pluginapi.QuotaBucket{}, false
 	}
@@ -340,8 +343,9 @@ func commandCodeWindowToBucket(window string, src *commandCodeWindowBucket) (plu
 	}
 	bucket := pluginapi.QuotaBucket{
 		Window:            window,
+		DisplayName:       displayName,
 		RemainingFraction: remaining / src.Cap,
-		Description:       fmt.Sprintf("%.2f / %.0f credits remaining", remaining, src.Cap),
+		Description:       fmt.Sprintf("%s：剩余 %.2f / %.0f credits", labelCN, remaining, src.Cap),
 	}
 	if src.ResetAt > 0 {
 		bucket.ResetTime = time.UnixMilli(src.ResetAt).UTC().Format(time.RFC3339)

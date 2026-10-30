@@ -29,9 +29,7 @@ func TestBuildCommandCodeGenerateBodyNeutralWorkspace(t *testing.T) {
 	if body.Config.WorkingDir != "/" {
 		t.Fatalf("workingDir = %q, want neutral /", body.Config.WorkingDir)
 	}
-	if body.Params.System != commandCodeNeutralSystem {
-		t.Fatalf("system should use neutral suppressor when client sent none, got %q", body.Params.System)
-	}
+	assertCachedSystem(t, body.Params.System, commandCodeNeutralSystem)
 	if body.Config.IsGitRepo || len(body.Config.Structure) != 0 || body.Config.GitStatus != "" {
 		t.Fatalf("workspace prompt fields must stay empty: %+v", body.Config)
 	}
@@ -66,9 +64,7 @@ func TestBuildCommandCodeGenerateBodyKeepsClientSystem(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Params.System != "Cursor agent system prompt" {
-		t.Fatalf("system = %q", body.Params.System)
-	}
+	assertCachedSystem(t, body.Params.System, "Cursor agent system prompt")
 	if body.Params.Tools == nil || len(body.Params.Tools) != 0 {
 		t.Fatalf("tools = %#v, want empty client tool list", body.Params.Tools)
 	}
@@ -78,5 +74,21 @@ func TestCommandCodeWorkingDirFromMetadata(t *testing.T) {
 	payload := []byte(`{"metadata":{"working_dir":"/tmp/project"},"messages":[{"role":"user","content":"x"}]}`)
 	if got := commandCodeWorkingDir(payload); got != "/tmp/project" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func assertCachedSystem(t *testing.T, system any, wantText string) {
+	t.Helper()
+	sections, ok := system.([]any)
+	if !ok || len(sections) != 1 {
+		t.Fatalf("system = %#v, want one cached text section", system)
+	}
+	section, _ := sections[0].(map[string]any)
+	if section["type"] != "text" || section["text"] != wantText {
+		t.Fatalf("system section = %#v, want text %q", section, wantText)
+	}
+	cache, _ := section["cache_control"].(map[string]any)
+	if cache["type"] != "ephemeral" {
+		t.Fatalf("cache_control = %#v, want ephemeral", section["cache_control"])
 	}
 }

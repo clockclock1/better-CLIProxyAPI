@@ -36,12 +36,12 @@ type commandCodeConfig struct {
 }
 
 type commandCodeParams struct {
-	Model       string  `json:"model"`
-	Messages    []any   `json:"messages"`
-	Tools       []any   `json:"tools"`
-	System      string  `json:"system"`
-	MaxTokens   int     `json:"max_tokens"`
-	Stream      bool    `json:"stream"`
+	Model       string   `json:"model"`
+	Messages    []any    `json:"messages"`
+	Tools       []any    `json:"tools"`
+	System      any      `json:"system"`
+	MaxTokens   int      `json:"max_tokens"`
+	Stream      bool     `json:"stream"`
 	Temperature *float64 `json:"temperature,omitempty"`
 }
 
@@ -96,14 +96,34 @@ func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, e
 			Model:    model,
 			Messages: messages,
 			// Only client-provided tools (empty slice disables upstream builtins).
-			Tools:       tools,
-			System:      system,
+			Tools: tools,
+			// Wire system as a cacheable text section so repeated prefixes can hit
+			// Command Code / provider prompt cache instead of billing full input each turn.
+			System:      commandCodeWireSystem(system),
 			MaxTokens:   maxTokens,
 			Stream:      true,
 			Temperature: temperature,
 		},
 	}
 	return json.Marshal(body)
+}
+
+// commandCodeWireSystem builds the /alpha/generate system payload with an
+// ephemeral cache breakpoint (same shape as the official CLI's toWireSystem).
+func commandCodeWireSystem(system string) any {
+	system = strings.TrimSpace(system)
+	if system == "" {
+		return ""
+	}
+	return []any{
+		map[string]any{
+			"type": "text",
+			"text": system,
+			"cache_control": map[string]any{
+				"type": "ephemeral",
+			},
+		},
+	}
 }
 
 func commandCodeWorkingDir(openaiPayload []byte) string {

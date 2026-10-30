@@ -90,6 +90,14 @@ func TestFetchCredentialQuota_CommandCodeBuiltin(t *testing.T) {
 	if gotWindows[0] != "five_hour" || gotWindows[1] != "weekly" || gotWindows[2] != "monthly" {
 		t.Fatalf("windows = %#v", gotWindows)
 	}
+	gotNames := []string{
+		quotaResp.Groups[0].Buckets[0].DisplayName,
+		quotaResp.Groups[0].Buckets[1].DisplayName,
+		quotaResp.Groups[0].Buckets[2].DisplayName,
+	}
+	if gotNames[0] != "五小时限额" || gotNames[1] != "周限额" || gotNames[2] != "月限额" {
+		t.Fatalf("display names = %#v", gotNames)
+	}
 	if got := quotaResp.Groups[0].Buckets[0].RemainingFraction; got < 0.89 || got > 0.91 {
 		t.Fatalf("five_hour remaining = %v, want ~0.9", got)
 	}

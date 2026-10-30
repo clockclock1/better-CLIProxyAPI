@@ -1789,6 +1789,7 @@ func (g *QuotaGroup) UnmarshalJSON(data []byte) error {
 // QuotaBucket describes a single quota window or limit bucket.
 type QuotaBucket struct {
 	Window            string  `json:"window,omitempty"`
+	DisplayName       string  `json:"displayName,omitempty"`
 	RemainingFraction float64 `json:"remainingFraction"`
 	ResetTime         string  `json:"resetTime,omitempty"`
 	Description       string  `json:"description,omitempty"`
@@ -1801,6 +1802,7 @@ func (b *QuotaBucket) UnmarshalJSON(data []byte) error {
 		*Alias
 		RemainingFraction    *float64 `json:"remainingFraction"`
 		AltRemainingFraction *float64 `json:"remaining_fraction"`
+		AltDisplayName       string   `json:"display_name"`
 		AltResetTime         string   `json:"reset_time"`
 	}{
 		Alias: (*Alias)(b),
@@ -1812,6 +1814,9 @@ func (b *QuotaBucket) UnmarshalJSON(data []byte) error {
 		b.RemainingFraction = *aux.RemainingFraction
 	} else if aux.AltRemainingFraction != nil {
 		b.RemainingFraction = *aux.AltRemainingFraction
+	}
+	if b.DisplayName == "" && aux.AltDisplayName != "" {
+		b.DisplayName = aux.AltDisplayName
 	}
 	if b.ResetTime == "" && aux.AltResetTime != "" {
 		b.ResetTime = aux.AltResetTime
