@@ -14,6 +14,9 @@ import (
 //go:embed models/commandcode_models.json
 var embeddedCommandCodeModelsJSON []byte
 
+//go:embed models/commandcode_capabilities.json
+var embeddedCommandCodeCapabilitiesJSON []byte
+
 type commandCodeModelsStore struct {
 	mu       sync.RWMutex
 	models   []*ModelInfo
@@ -178,11 +181,12 @@ func normalizeCommandCodeModelInfos(in []*ModelInfo) ([]*ModelInfo, error) {
 			cloned.InputTokenLimit = cloned.ContextLength
 		}
 		if cloned.OutputTokenLimit <= 0 {
-			cloned.OutputTokenLimit = 8192
+			cloned.OutputTokenLimit = commandCodeDefaultMaxOutputTokens
 		}
 		if cloned.MaxCompletionTokens <= 0 {
 			cloned.MaxCompletionTokens = cloned.OutputTokenLimit
 		}
+		applyCommandCodeCapability(cloned)
 		if len(cloned.SupportedInputModalities) == 0 {
 			cloned.SupportedInputModalities = commandCodeInputModalities(id)
 		}
@@ -213,14 +217,8 @@ func commandCodeModelInfoFromProvider(raw commandCodeProviderModelRaw) *ModelInf
 		display = commandCodeDisplayName(id)
 	}
 	ctxLen := raw.ContextLength
-	if ctxLen <= 0 {
-		ctxLen = 200000
-	}
 	outTokens := raw.MaxCompletionTokens
-	if outTokens <= 0 {
-		outTokens = 8192
-	}
-	return &ModelInfo{
+	info := &ModelInfo{
 		ID:                         id,
 		Object:                     "model",
 		Created:                    raw.Created,
@@ -235,6 +233,16 @@ func commandCodeModelInfoFromProvider(raw commandCodeProviderModelRaw) *ModelInf
 		SupportedOutputModalities:  []string{"text"},
 		SupportedGenerationMethods: []string{"generateContent"},
 	}
+	applyCommandCodeCapability(info)
+	if info.ContextLength <= 0 {
+		info.ContextLength = 200000
+		info.InputTokenLimit = info.ContextLength
+	}
+	if info.MaxCompletionTokens <= 0 {
+		info.MaxCompletionTokens = commandCodeDefaultMaxOutputTokens
+		info.OutputTokenLimit = info.MaxCompletionTokens
+	}
+	return info
 }
 
 func commandCodeDisplayName(id string) string {
@@ -277,6 +285,92 @@ func commandCodeInputModalities(id string) []string {
 	return []string{"text"}
 }
 
+// commandCodeDefaultMaxOutputTokens matches the official CLI DEFAULT_MAX_TOKENS
+// used when a catalog row leaves maxOutputTokens null.
+const commandCodeDefaultMaxOutputTokens = 64000
+
+type commandCodeCapability struct {
+	ContextLength    int      `json:"context_length"`
+	MaxOutputTokens  int      `json:"max_output_tokens"`
+	ReasoningEfforts []string `json:"reasoning_efforts"`
+}
+
+var commandCodeCapabilities = loadCommandCodeCapabilities()
+
+func loadCommandCodeCapabilities() map[string]commandCodeCapability {
+	out := map[string]commandCodeCapability{}
+	if len(bytes.TrimSpace(embeddedCommandCodeCapabilitiesJSON)) == 0 {
+		return out
+	}
+	if err := json.Unmarshal(embeddedCommandCodeCapabilitiesJSON, &out); err != nil {
+		log.Warnf("registry: commandcode capabilities: %v", err)
+	}
+	return out
+}
+
+func commandCodeCapabilityFor(modelID string) (commandCodeCapability, bool) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return commandCodeCapability{}, false
+	}
+	if cap, ok := commandCodeCapabilities[modelID]; ok {
+		return cap, true
+	}
+	if idx := strings.LastIndex(modelID, "/"); idx >= 0 {
+		if cap, ok := commandCodeCapabilities[modelID[idx+1:]]; ok {
+			return cap, true
+		}
+	}
+	return commandCodeCapability{}, false
+}
+
+// CommandCodeMaxOutputTokens is the catalog output cap for a model, or the CLI default.
+func CommandCodeMaxOutputTokens(modelID string) int {
+	if cap, ok := commandCodeCapabilityFor(modelID); ok && cap.MaxOutputTokens > 0 {
+		return cap.MaxOutputTokens
+	}
+	return commandCodeDefaultMaxOutputTokens
+}
+
+func applyCommandCodeCapability(info *ModelInfo) {
+	if info == nil {
+		return
+	}
+	cap, ok := commandCodeCapabilityFor(info.ID)
+	if !ok {
+		return
+	}
+	if info.ContextLength <= 0 && cap.ContextLength > 0 {
+		info.ContextLength = cap.ContextLength
+	}
+	if info.InputTokenLimit <= 0 {
+		info.InputTokenLimit = info.ContextLength
+	}
+	if cap.MaxOutputTokens > 0 && (info.MaxCompletionTokens <= 0 ||
+		info.MaxCompletionTokens == commandCodeDefaultMaxOutputTokens && cap.MaxOutputTokens != commandCodeDefaultMaxOutputTokens) {
+		info.MaxCompletionTokens = cap.MaxOutputTokens
+		info.OutputTokenLimit = cap.MaxOutputTokens
+	}
+	if info.OutputTokenLimit <= 0 {
+		info.OutputTokenLimit = info.MaxCompletionTokens
+	}
+	if info.Thinking == nil && len(cap.ReasoningEfforts) > 0 {
+		info.Thinking = &ThinkingSupport{Levels: append([]string(nil), cap.ReasoningEfforts...)}
+	}
+	if len(cap.ReasoningEfforts) > 0 && !stringSliceContains(info.SupportedParameters, "reasoning_effort") {
+		info.SupportedParameters = append(info.SupportedParameters, "reasoning_effort")
+	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 func firstNonEmptyString(values ...string) string {
 	for _, v := range values {
 		if strings.TrimSpace(v) != "" {
@@ -294,10 +388,10 @@ var staticCommandCodeModels = []*ModelInfo{
 		OwnedBy:                    "command-code",
 		Type:                       "commandcode",
 		DisplayName:                "Laguna S 2.1 (Free)",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
+		ContextLength:              256000,
+		MaxCompletionTokens:        32768,
+		InputTokenLimit:            256000,
+		OutputTokenLimit:           32768,
 		SupportedInputModalities:   []string{"text", "image"},
 		SupportedOutputModalities:  []string{"text"},
 		SupportedGenerationMethods: []string{"generateContent"},
@@ -308,10 +402,10 @@ var staticCommandCodeModels = []*ModelInfo{
 		OwnedBy:                    "command-code",
 		Type:                       "commandcode",
 		DisplayName:                "Beam (Free)",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
+		ContextLength:              1048576,
+		MaxCompletionTokens:        131072,
+		InputTokenLimit:            1048576,
+		OutputTokenLimit:           131072,
 		SupportedInputModalities:   []string{"text", "image"},
 		SupportedOutputModalities:  []string{"text"},
 		SupportedGenerationMethods: []string{"generateContent"},
@@ -322,10 +416,10 @@ var staticCommandCodeModels = []*ModelInfo{
 		OwnedBy:                    "command-code",
 		Type:                       "commandcode",
 		DisplayName:                "Glyph Cluster (Free)",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
+		ContextLength:              256000,
+		MaxCompletionTokens:        256000,
+		InputTokenLimit:            256000,
+		OutputTokenLimit:           256000,
 		SupportedInputModalities:   []string{"text", "image"},
 		SupportedOutputModalities:  []string{"text"},
 		SupportedGenerationMethods: []string{"generateContent"},

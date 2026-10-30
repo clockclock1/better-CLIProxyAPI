@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/google/uuid"
 	commandcodeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/commandcode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
@@ -18,7 +19,6 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -97,7 +97,8 @@ func (e *CommandCodeExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 // Execute aggregates /alpha/generate NDJSON into an OpenAI chat.completion response.
 func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	parsedThinking := thinking.ParseSuffix(req.Model)
+	baseModel := parsedThinking.ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
@@ -120,18 +121,20 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		translated = req.Payload
 	}
 	translated = helps.SetStringIfDifferent(translated, "model", baseModel)
+	if isCommandCodeEffort(parsedThinking.RawSuffix) && strings.TrimSpace(gjson.GetBytes(translated, "reasoning_effort").String()) == "" {
+		translated = helps.SetStringIfDifferent(translated, "reasoning_effort", strings.ToLower(strings.TrimSpace(parsedThinking.RawSuffix)))
+	}
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, false)
 	if len(originalTranslated) == 0 {
 		originalTranslated = originalPayloadSource
 	}
 
-	generateBody, errBody := buildCommandCodeGenerateBody(baseModel, translated)
+	sessionID := commandCodeSessionID(ctx, opts, translated)
+	generateBody, errBody := buildCommandCodeGenerateBody(baseModel, sessionID, translated)
 	if errBody != nil {
 		err = statusErr{code: http.StatusBadRequest, msg: errBody.Error()}
 		return resp, err
 	}
-
-	sessionID := commandCodeSessionID(opts)
 	url := strings.TrimSuffix(baseURL, "/") + "/alpha/generate"
 	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(generateBody))
 	if errReq != nil {
@@ -224,7 +227,8 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 // ExecuteStream streams /alpha/generate NDJSON as OpenAI chat.completion.chunk frames.
 func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	parsedThinking := thinking.ParseSuffix(req.Model)
+	baseModel := parsedThinking.ModelName
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
 	defer reporter.TrackFailure(ctx, &err)
 
@@ -247,15 +251,17 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		translated = req.Payload
 	}
 	translated = helps.SetStringIfDifferent(translated, "model", baseModel)
+	if isCommandCodeEffort(parsedThinking.RawSuffix) && strings.TrimSpace(gjson.GetBytes(translated, "reasoning_effort").String()) == "" {
+		translated = helps.SetStringIfDifferent(translated, "reasoning_effort", strings.ToLower(strings.TrimSpace(parsedThinking.RawSuffix)))
+	}
 	_ = originalPayloadSource
 
-	generateBody, errBody := buildCommandCodeGenerateBody(baseModel, translated)
+	sessionID := commandCodeSessionID(ctx, opts, translated)
+	generateBody, errBody := buildCommandCodeGenerateBody(baseModel, sessionID, translated)
 	if errBody != nil {
 		err = statusErr{code: http.StatusBadRequest, msg: errBody.Error()}
 		return nil, err
 	}
-
-	sessionID := commandCodeSessionID(opts)
 	url := strings.TrimSuffix(baseURL, "/") + "/alpha/generate"
 	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(generateBody))
 	if errReq != nil {
@@ -502,26 +508,45 @@ func applyCommandCodeHeaders(req *http.Request, auth *cliproxyauth.Auth, session
 		attrs = auth.Attributes
 	}
 	version := commandcodeauth.HeaderCLIVersion(attrs)
-	if sessionID == "" {
-		sessionID = uuid.NewString()
-	}
 	req.Header.Set("User-Agent", "cli")
 	req.Header.Set("x-command-code-version", version)
 	req.Header.Set("x-cli-environment", "production")
 	// Neutral slug — avoid pulling proxy-repo-specific server prompt/taste context.
 	req.Header.Set("x-project-slug", "proxy")
 	req.Header.Set("x-taste-learning", "false")
-	req.Header.Set("x-session-id", sessionID)
+	if sessionID != "" {
+		req.Header.Set("x-session-id", sessionID)
+	}
 }
 
-func commandCodeSessionID(opts cliproxyexecutor.Options) string {
+// commandCodeSessionID is the stable prompt-cache scope. Codex pins this with
+// prompt_cache_key; Command Code pins it with threadId / x-session-id. A new
+// UUID per request makes the server miss the cache every turn.
+func commandCodeSessionID(ctx context.Context, opts cliproxyexecutor.Options, payload []byte) string {
+	if id := strings.TrimSpace(util.SessionIDFromContext(ctx)); id != "" {
+		return commandCodeThreadUUID(id)
+	}
 	if opts.Metadata != nil {
 		if v, ok := opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
+			return commandCodeThreadUUID(v)
 		}
 		if v, ok := opts.Metadata[cliproxyexecutor.ExecutionSessionMetadataKey].(string); ok && strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
+			return commandCodeThreadUUID(v)
 		}
 	}
-	return uuid.NewString()
+	if id := helps.ProviderSessionUUID("commandcode", opts.Metadata); id != "" {
+		return id
+	}
+	return commandCodeConversationUUID(payload)
+}
+
+func commandCodeThreadUUID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	if parsed, err := uuid.Parse(id); err == nil {
+		return parsed.String()
+	}
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("commandcode-thread\x00"+id)).String()
 }

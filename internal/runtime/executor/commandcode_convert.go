@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/tidwall/gjson"
 )
 
@@ -20,7 +21,12 @@ type commandCodeGenerateBody struct {
 	Skills         any               `json:"skills"`
 	PermissionMode string            `json:"permissionMode"`
 	Mode           string            `json:"mode"`
-	Params         commandCodeParams `json:"params"`
+	// ThreadID is the stable conversation UUID (official CLI threadId). The
+	// server uses it as the prompt-cache scope the way Codex uses prompt_cache_key.
+	// A fresh id on every request never reads cache back. Omit promptCache so the
+	// server does not treat the turn as promptCache:"off".
+	ThreadID string            `json:"threadId,omitempty"`
+	Params   commandCodeParams `json:"params"`
 }
 
 type commandCodeConfig struct {
@@ -36,13 +42,14 @@ type commandCodeConfig struct {
 }
 
 type commandCodeParams struct {
-	Model       string   `json:"model"`
-	Messages    []any    `json:"messages"`
-	Tools       []any    `json:"tools"`
-	System      any      `json:"system"`
-	MaxTokens   int      `json:"max_tokens"`
-	Stream      bool     `json:"stream"`
-	Temperature *float64 `json:"temperature,omitempty"`
+	Model           string   `json:"model"`
+	Messages        []any    `json:"messages"`
+	Tools           []any    `json:"tools"`
+	System          any      `json:"system"`
+	MaxTokens       int      `json:"max_tokens"`
+	Stream          bool     `json:"stream"`
+	Temperature     *float64 `json:"temperature,omitempty"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
 }
 
 // commandCodeNeutralSystem suppresses Command Code's built-in agent prompt when the
@@ -51,19 +58,32 @@ type commandCodeParams struct {
 // taste, identity). Keep this short and free of filesystem/repo framing.
 const commandCodeNeutralSystem = "You are a helpful assistant. Use only the tools provided in this request when tools are needed. Do not invent a working directory, repository, or local filesystem context."
 
-func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, error) {
+func buildCommandCodeGenerateBody(model, threadID string, openaiPayload []byte) ([]byte, error) {
 	messages, system := openaiMessagesToCommandCode(openaiPayload)
 	tools := openaiToolsToCommandCode(openaiPayload)
 	if strings.TrimSpace(system) == "" {
 		system = commandCodeNeutralSystem
 	}
+	// Claude-style rolling breakpoint: cache the prefix through the latest
+	// message, not only the system block. A system-only breakpoint leaves the
+	// growing transcript uncached.
+	markCommandCodeMessageCache(messages)
+	markCommandCodeToolCache(tools)
+	threadID = strings.TrimSpace(threadID)
+	if threadID == "" {
+		threadID = commandCodeConversationUUID(openaiPayload)
+	}
 
-	maxTokens := 8192
+	maxTokens := registry.CommandCodeMaxOutputTokens(model)
 	if v := gjson.GetBytes(openaiPayload, "max_tokens"); v.Exists() && v.Int() > 0 {
 		maxTokens = int(v.Int())
 	} else if v := gjson.GetBytes(openaiPayload, "max_completion_tokens"); v.Exists() && v.Int() > 0 {
 		maxTokens = int(v.Int())
 	}
+	if cap := registry.CommandCodeMaxOutputTokens(model); cap > 0 && maxTokens > cap {
+		maxTokens = cap
+	}
+	effort := commandCodeReasoningEffort(openaiPayload)
 
 	var temperature *float64
 	if v := gjson.GetBytes(openaiPayload, "temperature"); v.Exists() && v.Type == gjson.Number {
@@ -92,6 +112,7 @@ func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, e
 		Skills:         nil,
 		PermissionMode: "standard",
 		Mode:           "agent",
+		ThreadID:       threadID,
 		Params: commandCodeParams{
 			Model:    model,
 			Messages: messages,
@@ -99,10 +120,11 @@ func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, e
 			Tools: tools,
 			// Wire system as a cacheable text section so repeated prefixes can hit
 			// Command Code / provider prompt cache instead of billing full input each turn.
-			System:      commandCodeWireSystem(system),
-			MaxTokens:   maxTokens,
-			Stream:      true,
-			Temperature: temperature,
+			System:          commandCodeWireSystem(system),
+			MaxTokens:       maxTokens,
+			Stream:          true,
+			Temperature:     temperature,
+			ReasoningEffort: effort,
 		},
 	}
 	return json.Marshal(body)
@@ -110,6 +132,77 @@ func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, e
 
 // commandCodeWireSystem builds the /alpha/generate system payload with an
 // ephemeral cache breakpoint (same shape as the official CLI's toWireSystem).
+func markCommandCodeMessageCache(messages []any) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg, ok := messages[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for j := len(content) - 1; j >= 0; j-- {
+			block, ok := content[j].(map[string]any)
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "text", "tool-result":
+				block["cache_control"] = map[string]any{"type": "ephemeral"}
+				return
+			}
+		}
+	}
+}
+
+func markCommandCodeToolCache(tools []any) {
+	if len(tools) == 0 {
+		return
+	}
+	tool, ok := tools[len(tools)-1].(map[string]any)
+	if !ok {
+		return
+	}
+	tool["cache_control"] = map[string]any{"type": "ephemeral"}
+}
+
+// commandCodeConversationUUID is a stable thread id for clients that do not send
+// a session header. It is derived from the system prompt plus the first user
+// turn, so later turns of the same chat keep the same cache scope.
+func commandCodeConversationUUID(openaiPayload []byte) string {
+	_, system := openaiMessagesToCommandCode(openaiPayload)
+	system = strings.TrimSpace(system)
+	firstUser := ""
+	gjson.GetBytes(openaiPayload, "messages").ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() != "user" {
+			return true
+		}
+		firstUser = strings.TrimSpace(contentToPlainText(msg.Get("content")))
+		return false
+	})
+	if system == "" && firstUser == "" {
+		return ""
+	}
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("commandcode-conversation\x00"+system+"\x00"+firstUser)).String()
+}
+
+func commandCodeReasoningEffort(openaiPayload []byte) string {
+	if v := strings.TrimSpace(gjson.GetBytes(openaiPayload, "reasoning_effort").String()); isCommandCodeEffort(v) {
+		return strings.ToLower(v)
+	}
+	return ""
+}
+
+func isCommandCodeEffort(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "off", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
 func commandCodeWireSystem(system string) any {
 	system = strings.TrimSpace(system)
 	if system == "" {
@@ -328,15 +421,32 @@ func usageFromCommandCodeTotal(event gjson.Result) map[string]any {
 	}
 	prompt := src.Get("inputTokens").Int()
 	completion := src.Get("outputTokens").Int()
+	cacheRead := src.Get("inputTokenDetails.cacheReadTokens").Int()
+	if cacheRead == 0 {
+		cacheRead = src.Get("cacheReadTokens").Int()
+	}
+	cacheWrite := src.Get("inputTokenDetails.cacheWriteTokens").Int()
+	if cacheWrite == 0 {
+		cacheWrite = src.Get("cacheWriteTokens").Int()
+	}
+	// Upstream inputTokens excludes cache read/write, matching the CLI's split.
+	// OpenAI prompt_tokens includes them, with the read portion in cached_tokens.
+	prompt += cacheRead + cacheWrite
 	total := src.Get("totalTokens").Int()
-	if total == 0 {
+	if total == 0 || cacheRead > 0 || cacheWrite > 0 {
 		total = prompt + completion
 	}
-	return map[string]any{
+	usage := map[string]any{
 		"prompt_tokens":     prompt,
 		"completion_tokens": completion,
 		"total_tokens":      total,
 	}
+	if cacheRead > 0 || cacheWrite > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cacheRead}
+		usage["cache_read_input_tokens"] = cacheRead
+		usage["cache_creation_input_tokens"] = cacheWrite
+	}
+	return usage
 }
 
 type commandCodeOpenAIAccumulator struct {
