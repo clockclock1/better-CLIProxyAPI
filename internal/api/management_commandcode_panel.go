@@ -1,23 +1,44 @@
 package api
 
 import (
-	"bytes"
+	"regexp"
 	"strings"
+)
+
+// Matches the minified Devin OAuth card across CPAMC builds (icon identifiers change).
+var reDevinOAuthCard = regexp.MustCompile(
+	`\{kind:` + "`builtin`" + `,id:` + "`devin`" + `,label:` + "`Devin`" +
+		`,titleKey:` + "`auth_login.devin_oauth_title`" +
+		`,icon:(?:\{light:[A-Za-z0-9_$]+,dark:[A-Za-z0-9_$]+\}|[A-Za-z0-9_$]+),flow:` + "`browser`" + `\}`,
 )
 
 // patchManagementHTMLForCommandCode injects Command Code into the upstream CPAMC
 // control panel (management.html), which hardcodes OAuth provider cards.
 func patchManagementHTMLForCommandCode(raw []byte) []byte {
-	if len(raw) == 0 || bytes.Contains(raw, []byte("id:`commandcode`")) || bytes.Contains(raw, []byte(`id:"commandcode"`)) {
+	if len(raw) == 0 {
 		return raw
 	}
 	out := string(raw)
 
-	// Builtin OAuth provider card list (IN=[{...},{id:`devin`,...}])
-	devinCard := "{kind:`builtin`,id:`devin`,label:`Devin`,titleKey:`auth_login.devin_oauth_title`,icon:{light:iS,dark:aS},flow:`browser`}"
-	commandCard := "{kind:`builtin`,id:`commandcode`,label:`Command Code`,titleKey:`auth_login.commandcode_oauth_title`,icon:{light:iS,dark:aS},flow:`browser`}"
-	if strings.Contains(out, devinCard) && !strings.Contains(out, commandCard) {
-		out = strings.Replace(out, devinCard, devinCard+","+commandCard, 1)
+	// Already has the OAuth provider card — still ensure sets / i18n / filters.
+	hasOAuthCard := strings.Contains(out, "kind:`builtin`,id:`commandcode`") ||
+		strings.Contains(out, `kind:"builtin",id:"commandcode"`)
+
+	if !hasOAuthCard {
+		if loc := reDevinOAuthCard.FindStringIndex(out); loc != nil {
+			devinCard := out[loc[0]:loc[1]]
+			// Reuse Devin's icon identifiers so the minified asset stays consistent.
+			iconPart := "icon:{light:xx,dark:Sx}"
+			if idx := strings.Index(devinCard, ",icon:"); idx >= 0 {
+				end := strings.LastIndex(devinCard, ",flow:")
+				if end > idx {
+					iconPart = devinCard[idx+1 : end] // "icon:..."
+				}
+			}
+			commandCard := "{kind:`builtin`,id:`commandcode`,label:`Command Code`,titleKey:`auth_login.commandcode_oauth_title`," +
+				iconPart + ",flow:`browser`}"
+			out = out[:loc[1]] + "," + commandCard + out[loc[1]:]
+		}
 	}
 
 	// Recommended / browser-callback provider sets used by startAuth(is_webui).
@@ -58,8 +79,6 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 			out = strings.Replace(out, pair[0], pair[1], 1)
 		}
 	}
-	// English block may already have been partially matched by the first zh pattern;
-	// ensure English title exists when the Start Devin Login phrase is present.
 	if strings.Contains(out, "devin_oauth_button:`Start Devin Login`") && !strings.Contains(out, "commandcode_oauth_button:`Start Command Code Login`") {
 		out = strings.Replace(
 			out,
