@@ -1,0 +1,155 @@
+name: build-binaries
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION_FILE: go.mod
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: CLIProxyAPI
+            archive: tar.gz
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            binary: CLIProxyAPI
+            archive: tar.gz
+          - target: windows-amd64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+            binary: CLIProxyAPI.exe
+            archive: zip
+          - target: darwin-arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+            binary: CLIProxyAPI
+            archive: tar.gz
+          - target: darwin-amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            binary: CLIProxyAPI
+            archive: tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GO_VERSION_FILE }}
+          cache: true
+      - name: Build metadata
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo "${GITHUB_SHA::7}")"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist/"${{ matrix.target }}"
+          go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" \
+            -o "dist/${{ matrix.target }}/${{ matrix.binary }}" \
+            ./cmd/server/
+          cp LICENSE README.md README_CN.md config.example.yaml "dist/${{ matrix.target }}/"
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_name="CLIProxyAPI_${VERSION}_${{ matrix.target }}"
+          mkdir -p dist/archives
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (
+              cd "dist/${{ matrix.target }}"
+              if command -v zip >/dev/null 2>&1; then
+                zip -r "../archives/${archive_name}.zip" .
+              else
+                powershell -NoProfile -Command "Compress-Archive -Path * -DestinationPath '../archives/${archive_name}.zip'"
+              fi
+            )
+            echo "ASSET_PATH=dist/archives/${archive_name}.zip" >> "$GITHUB_ENV"
+          else
+            tar -C "dist/${{ matrix.target }}" -czf "dist/archives/${archive_name}.tar.gz" .
+            echo "ASSET_PATH=dist/archives/${archive_name}.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  publish-release-assets:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: binaries-*
+      - name: Ensure GitHub Release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Binary and container release for ${GITHUB_REF_NAME}. Docker image: ghcr.io/clockclock1/better-cliproxyapi:${GITHUB_REF_NAME}"
+          fi
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/CLIProxyAPI_*.tar.gz dist/CLIProxyAPI_*.zip)
+          if [[ ${#assets[@]} -eq 0 ]]; then
+            echo "No binary archives found" >&2
+            find dist -type f >&2 || true
+            exit 1
+          fi
+          gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --repo "${GITHUB_REPOSITORY}" --clobber
+          (
+            cd dist
+            sha256sum CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip 2>/dev/null | sort -k2 > checksums.txt || \
+              shasum -a 256 CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip | sort -k2 > checksums.txt
+          )
+          gh release upload "${GITHUB_REF_NAME}" dist/checksums.txt --repo "${GITHUB_REPOSITORY}" --clobber

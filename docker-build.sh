@@ -23,7 +23,10 @@ read -r -p "Enter choice [1-2]: " choice
 case "$choice" in
   1)
     echo "--- Running with Pre-built Image ---"
-    docker compose up -d --remove-orphans --no-build
+    export CLI_PROXY_IMAGE="${CLI_PROXY_IMAGE:-ghcr.io/clockclock1/better-cliproxyapi:latest}"
+    echo "Using image: ${CLI_PROXY_IMAGE}"
+    docker compose pull
+    docker compose up -d --remove-orphans --no-build --pull always
     echo "Services are starting from remote image."
     echo "Run 'docker compose logs -f' to see the logs."
     ;;

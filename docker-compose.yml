@@ -1,7 +1,9 @@
 services:
   cli-proxy-api:
-    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
-    pull_policy: always
+    # Default: pull the GHCR image built by this fork's Packages workflow.
+    # Override with CLI_PROXY_IMAGE=... or build locally via docker-build.sh option 2.
+    image: ${CLI_PROXY_IMAGE:-ghcr.io/clockclock1/better-cliproxyapi:latest}
+    pull_policy: ${CLI_PROXY_PULL_POLICY:-always}
     build:
       context: .
       dockerfile: Dockerfile

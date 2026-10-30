@@ -16,7 +16,12 @@ $choice = Read-Host -Prompt "Enter choice [1-2]"
 switch ($choice) {
     "1" {
         Write-Host "--- Running with Pre-built Image ---"
-        docker compose up -d --remove-orphans --no-build
+        if (-not $env:CLI_PROXY_IMAGE) {
+            $env:CLI_PROXY_IMAGE = "ghcr.io/clockclock1/better-cliproxyapi:latest"
+        }
+        Write-Host "Using image: $($env:CLI_PROXY_IMAGE)"
+        docker compose pull
+        docker compose up -d --remove-orphans --no-build --pull always
         Write-Host "Services are starting from remote image."
         Write-Host "Run 'docker compose logs -f' to see the logs."
     }
