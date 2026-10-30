@@ -35,6 +35,7 @@ type CommandCodeExecutor struct {
 
 // NewCommandCodeExecutor constructs a Command Code executor.
 func NewCommandCodeExecutor(cfg *config.Config) *CommandCodeExecutor {
+	commandcodeauth.StartCLIVersionUpdater(context.Background())
 	return &CommandCodeExecutor{cfg: cfg}
 }
 
@@ -165,7 +166,7 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := doCommandCodeGenerateWithVersionRetry(ctx, httpClient, httpReq, auth, sessionID, generateBody)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
@@ -290,7 +291,7 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
-	httpResp, errDo := httpClient.Do(httpReq)
+	httpResp, errDo := doCommandCodeGenerateWithVersionRetry(ctx, httpClient, httpReq, auth, sessionID, generateBody)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
@@ -459,26 +460,56 @@ func commandCodeCreds(a *cliproxyauth.Auth) (baseURL, apiKey string) {
 	return strings.TrimRight(baseURL, "/"), apiKey
 }
 
+// doCommandCodeGenerateWithVersionRetry sends /alpha/generate and, on
+// upgrade_required, bumps the cached CLI version then retries once.
+func doCommandCodeGenerateWithVersionRetry(ctx context.Context, client *http.Client, req *http.Request, auth *cliproxyauth.Auth, sessionID string, body []byte) (*http.Response, error) {
+	httpResp, errDo := client.Do(req)
+	if errDo != nil {
+		return nil, errDo
+	}
+	if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+		return httpResp, nil
+	}
+	errBody, _ := io.ReadAll(httpResp.Body)
+	_ = httpResp.Body.Close()
+	changed, minVersion := commandcodeauth.NoteUpgradeRequired(errBody)
+	if minVersion == "" && !strings.Contains(strings.ToLower(string(errBody)), "upgrade_required") {
+		httpResp.Body = io.NopCloser(bytes.NewReader(errBody))
+		return httpResp, nil
+	}
+	helps.LogWithRequestID(ctx).Infof("commandcode: upgrade_required (min=%s changed=%v); retrying with cli version %s", minVersion, changed, commandcodeauth.CurrentCLIVersion())
+	retryReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, req.URL.String(), bytes.NewReader(body))
+	if errReq != nil {
+		httpResp.Body = io.NopCloser(bytes.NewReader(errBody))
+		return httpResp, nil
+	}
+	retryReq.Header = req.Header.Clone()
+	applyCommandCodeHeaders(retryReq, auth, sessionID)
+	retryResp, errRetry := client.Do(retryReq)
+	if errRetry != nil {
+		httpResp.Body = io.NopCloser(bytes.NewReader(errBody))
+		return httpResp, nil
+	}
+	return retryResp, nil
+}
+
 func applyCommandCodeHeaders(req *http.Request, auth *cliproxyauth.Auth, sessionID string) {
 	if req == nil {
 		return
 	}
-	version := commandcodeauth.DefaultCLIVersion
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["cli_version"]); v != "" {
-			version = v
-		}
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
 	}
-	if v := strings.TrimSpace(os.Getenv("COMMANDCODE_CLI_VERSION")); v != "" {
-		version = v
-	}
+	version := commandcodeauth.HeaderCLIVersion(attrs)
 	if sessionID == "" {
 		sessionID = uuid.NewString()
 	}
 	req.Header.Set("User-Agent", "cli")
 	req.Header.Set("x-command-code-version", version)
 	req.Header.Set("x-cli-environment", "production")
-	req.Header.Set("x-project-slug", "cli-proxy-api")
+	// Neutral slug — avoid pulling proxy-repo-specific server prompt/taste context.
+	req.Header.Set("x-project-slug", "proxy")
 	req.Header.Set("x-taste-learning", "false")
 	req.Header.Set("x-session-id", sessionID)
 }

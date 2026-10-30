@@ -19,6 +19,10 @@ import (
 	xcurrency "golang.org/x/text/currency"
 )
 
+// builtinCommandCodeQuotaPluginID is the synthetic plugin id exposed to v8 CPAMC
+// for the in-process Command Code quota implementation (no external plugin).
+const builtinCommandCodeQuotaPluginID = "builtin-commandcode"
+
 type credentialQuotaRequest struct {
 	AuthIndexSnake  *string `json:"auth_index"`
 	AuthIndexCamel  *string `json:"authIndex"`
@@ -43,7 +47,7 @@ func (r credentialQuotaRequest) resolveAuthIndex() string {
 // GetQuotaProviders returns the list of registered quota providers.
 func (h *Handler) GetQuotaProviders(c *gin.Context) {
 	builtin := []gin.H{{
-		"plugin_id":           "builtin-commandcode",
+		"plugin_id":           builtinCommandCodeQuotaPluginID,
 		"provider":            "commandcode",
 		"display_name":        "Command Code",
 		"supported_providers": []string{"commandcode"},
@@ -293,6 +297,23 @@ func (h *Handler) fetchQuotaForPlugin(c *gin.Context, pluginID, authIndex string
 	auth := h.authByIndex(authIndex)
 	if auth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth not found"})
+		return
+	}
+
+	pluginID = strings.TrimSpace(pluginID)
+	if pluginID == builtinCommandCodeQuotaPluginID ||
+		(pluginID == "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "commandcode")) {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "commandcode") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "builtin-commandcode only supports commandcode credentials"})
+			return
+		}
+		quotaResp, errCC := h.fetchCommandCodeQuota(c, auth)
+		if errCC != nil {
+			log.WithError(errCC).Warnf("failed to fetch Command Code quota for credential %s", auth.Index)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errCC)})
+			return
+		}
+		c.JSON(http.StatusOK, quotaResp)
 		return
 	}
 

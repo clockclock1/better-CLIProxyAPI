@@ -43,17 +43,32 @@ var commandCodePlanNames = map[string]string{
 	"teams-pro":           "Teams Pro",
 }
 
+type commandCodeWindowBucket struct {
+	Used     float64 `json:"used"`
+	Cap      float64 `json:"cap"`
+	Exceeded bool    `json:"exceeded"`
+	ResetAt  int64   `json:"resetAt"` // unix milliseconds
+}
+
+type commandCodeWindowLimits struct {
+	Limited  bool                     `json:"limited"`
+	Exceeded any                      `json:"exceeded"`
+	FiveHour *commandCodeWindowBucket `json:"fiveHour"`
+	Weekly   *commandCodeWindowBucket `json:"weekly"`
+}
+
 type commandCodeCreditsResponse struct {
 	Credits *struct {
-		PlanID            string   `json:"planId"`
-		MonthlyCredits    float64  `json:"monthlyCredits"`
-		PurchasedCredits  float64  `json:"purchasedCredits"`
-		FreeCredits       float64  `json:"freeCredits"`
-		SandboxMinutes    *float64 `json:"sandboxMinutes"`
-		SandboxAccess     bool     `json:"sandboxAccess"`
-		WindowLimits      any      `json:"windowLimits"`
+		PlanID           string   `json:"planId"`
+		MonthlyCredits   float64  `json:"monthlyCredits"`
+		PurchasedCredits float64  `json:"purchasedCredits"`
+		FreeCredits      float64  `json:"freeCredits"`
+		SandboxMinutes   *float64 `json:"sandboxMinutes"`
+		SandboxAccess    bool     `json:"sandboxAccess"`
 	} `json:"credits"`
-	PlanID string `json:"planId"`
+	// windowLimits is a sibling of credits in /alpha/billing/credits (not nested).
+	WindowLimits *commandCodeWindowLimits `json:"windowLimits"`
+	PlanID       string                   `json:"planId"`
 }
 
 type commandCodeSubscriptionResponse struct {
@@ -119,16 +134,11 @@ func commandCodeAPIKey(auth *coreauth.Auth) string {
 }
 
 func commandCodeCLIVersion(auth *coreauth.Auth) string {
-	version := commandcodeauth.DefaultCLIVersion
-	if auth != nil && auth.Attributes != nil {
-		if v := strings.TrimSpace(auth.Attributes["cli_version"]); v != "" {
-			version = v
-		}
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
 	}
-	if v := strings.TrimSpace(os.Getenv("COMMANDCODE_CLI_VERSION")); v != "" {
-		version = v
-	}
-	return version
+	return commandcodeauth.HeaderCLIVersion(attrs)
 }
 
 func (h *Handler) commandCodeHTTPClient(c *gin.Context, auth *coreauth.Auth) *http.Client {
@@ -236,28 +246,12 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 	}
 
 	totalRemaining := monthly + purchased + free
-	summary := []pluginapi.QuotaMetric{
-		{Key: "monthly_credits", Label: "Monthly credits", Value: monthly, Unit: "credits", Format: "number"},
-		{Key: "purchased_credits", Label: "Purchased credits", Value: purchased, Unit: "credits", Format: "number"},
-		{Key: "free_credits", Label: "Free credits", Value: free, Unit: "credits", Format: "number"},
-		{Key: "total_remaining", Label: "Total remaining", Value: totalRemaining, Unit: "credits", Format: "number"},
-	}
-	if usage.TotalCost > 0 {
-		summary = append(summary, pluginapi.QuotaMetric{
-			Key: "total_spent", Label: "Usage spend", Value: usage.TotalCost, Unit: "credits", Format: "number",
-		})
-	}
-	if credits.Credits != nil && credits.Credits.SandboxMinutes != nil {
-		summary = append(summary, pluginapi.QuotaMetric{
-			Key: "sandbox_minutes", Label: "Sandbox minutes", Value: *credits.Credits.SandboxMinutes, Unit: "min", Format: "number",
-		})
-	}
-
-	resp := pluginapi.QuotaFetchResponse{Summary: summary}
 	planName := commandCodePlanNames[planID]
 	if planName == "" && planID != "" {
 		planName = planID
 	}
+
+	resp := pluginapi.QuotaFetchResponse{}
 	if planName != "" || subStatus != "" {
 		resp.Subscription = &pluginapi.QuotaSubscription{
 			Plan:     planName,
@@ -266,6 +260,17 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 		}
 	}
 
+	// Prefer rolling window limits (5h / weekly / monthly) — CPAMC renders these as
+	// the segmented "usage limits" columns. Credit pills are secondary.
+	buckets := make([]pluginapi.QuotaBucket, 0, 3)
+	if credits.WindowLimits != nil {
+		if b, ok := commandCodeWindowToBucket("five_hour", credits.WindowLimits.FiveHour); ok {
+			buckets = append(buckets, b)
+		}
+		if b, ok := commandCodeWindowToBucket("weekly", credits.WindowLimits.Weekly); ok {
+			buckets = append(buckets, b)
+		}
+	}
 	planTotal, hasPlanTotal := commandCodePlanMonthlyCredits[planID]
 	if hasPlanTotal && planTotal > 0 && (subStatus == "" || strings.EqualFold(subStatus, "active")) {
 		remaining := monthly
@@ -275,19 +280,19 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 		if remaining > planTotal {
 			remaining = planTotal
 		}
-		fraction := remaining / planTotal
-		bucket := pluginapi.QuotaBucket{
+		buckets = append(buckets, pluginapi.QuotaBucket{
 			Window:            "monthly",
-			RemainingFraction: fraction,
+			RemainingFraction: remaining / planTotal,
 			ResetTime:         periodEnd,
 			Description:       fmt.Sprintf("%.1f / %.0f monthly credits remaining", remaining, planTotal),
-		}
+		})
+	}
+	if len(buckets) > 0 {
 		resp.Groups = []pluginapi.QuotaGroup{{
-			DisplayName: "Plan credits",
-			Buckets:     []pluginapi.QuotaBucket{bucket},
+			DisplayName: "Usage limits",
+			Buckets:     buckets,
 		}}
 	} else if totalRemaining > 0 || purchased > 0 || free > 0 {
-		// No known plan pool: expose remaining as a synthetic full bucket when any credits exist.
 		resp.Groups = []pluginapi.QuotaGroup{{
 			DisplayName: "Credits",
 			Buckets: []pluginapi.QuotaBucket{{
@@ -298,7 +303,50 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 		}}
 	}
 
+	// Keep a compact credit summary when window meters are absent, or as extra detail.
+	if len(buckets) == 0 || purchased > 0 || free > 0 || (credits.Credits != nil && credits.Credits.SandboxMinutes != nil) {
+		summary := []pluginapi.QuotaMetric{
+			{Key: "monthly_credits", Label: "Monthly credits", Value: monthly, Unit: "credits", Format: "number"},
+			{Key: "purchased_credits", Label: "Purchased credits", Value: purchased, Unit: "credits", Format: "number"},
+			{Key: "free_credits", Label: "Free credits", Value: free, Unit: "credits", Format: "number"},
+			{Key: "total_remaining", Label: "Total remaining", Value: totalRemaining, Unit: "credits", Format: "number"},
+		}
+		if usage.TotalCost > 0 {
+			summary = append(summary, pluginapi.QuotaMetric{
+				Key: "total_spent", Label: "Usage spend", Value: usage.TotalCost, Unit: "credits", Format: "number",
+			})
+		}
+		if credits.Credits != nil && credits.Credits.SandboxMinutes != nil {
+			summary = append(summary, pluginapi.QuotaMetric{
+				Key: "sandbox_minutes", Label: "Sandbox minutes", Value: *credits.Credits.SandboxMinutes, Unit: "min", Format: "number",
+			})
+		}
+		resp.Summary = summary
+	}
+
 	return resp, nil
+}
+
+func commandCodeWindowToBucket(window string, src *commandCodeWindowBucket) (pluginapi.QuotaBucket, bool) {
+	if src == nil || src.Cap <= 0 {
+		return pluginapi.QuotaBucket{}, false
+	}
+	remaining := src.Cap - src.Used
+	if remaining < 0 || src.Exceeded {
+		remaining = 0
+	}
+	if remaining > src.Cap {
+		remaining = src.Cap
+	}
+	bucket := pluginapi.QuotaBucket{
+		Window:            window,
+		RemainingFraction: remaining / src.Cap,
+		Description:       fmt.Sprintf("%.2f / %.0f credits remaining", remaining, src.Cap),
+	}
+	if src.ResetAt > 0 {
+		bucket.ResetTime = time.UnixMilli(src.ResetAt).UTC().Format(time.RFC3339)
+	}
+	return bucket, true
 }
 
 // lookupCommandCodeIdentity fetches /alpha/whoami to fill username when importing an API key.

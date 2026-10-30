@@ -703,6 +703,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 	if strings.EqualFold(strings.TrimSpace(auth.Provider), "commandcode") {
 		entry["supports_quota"] = true
 		entry["quota_provider"] = "commandcode"
+		// v8 CPAMC only fetches quota via /plugins/:id/quota; expose the in-process
+		// Command Code implementation as a synthetic plugin id (no real plugin needed).
+		if quota.v8 {
+			if _, hasPlugin := entry["quota_plugin_id"]; !hasPlugin {
+				entry["quota_plugin_id"] = builtinCommandCodeQuotaPluginID
+			}
+		}
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email

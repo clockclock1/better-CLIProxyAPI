@@ -23,8 +23,10 @@ const (
 	DefaultStudioBaseURL = "https://commandcode.ai"
 	// DefaultAPIBaseURL is the Command Code API host for /alpha/generate.
 	DefaultAPIBaseURL = "https://api.commandcode.ai"
-	// DefaultCLIVersion matches the desktop-shipped command-code CLI; server minVersion is 0.18.10.
-	DefaultCLIVersion = "1.88.1"
+	// DefaultCLIVersion is the bootstrap fallback for x-command-code-version.
+	// Prefer CurrentCLIVersion() / HeaderCLIVersion(), which auto-refresh from npm
+	// (and bump on upgrade_required). Server minVersion is currently 0.18.10.
+	DefaultCLIVersion = "1.88.2"
 
 	oauthTimeout = 5 * time.Minute
 )

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
@@ -46,9 +45,18 @@ type commandCodeParams struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 }
 
+// commandCodeNeutralSystem suppresses Command Code's built-in agent prompt when the
+// client did not supply its own system message. An empty system string makes
+// /alpha/generate expand a multi-thousand-token workspace/agent prompt (cwd, tools,
+// taste, identity). Keep this short and free of filesystem/repo framing.
+const commandCodeNeutralSystem = "You are a helpful assistant. Use only the tools provided in this request when tools are needed. Do not invent a working directory, repository, or local filesystem context."
+
 func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, error) {
 	messages, system := openaiMessagesToCommandCode(openaiPayload)
 	tools := openaiToolsToCommandCode(openaiPayload)
+	if strings.TrimSpace(system) == "" {
+		system = commandCodeNeutralSystem
+	}
 
 	maxTokens := 8192
 	if v := gjson.GetBytes(openaiPayload, "max_tokens"); v.Exists() && v.Int() > 0 {
@@ -65,8 +73,10 @@ func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, e
 
 	body := commandCodeGenerateBody{
 		Config: commandCodeConfig{
-			// Prefer request/env working dir; otherwise use the process cwd (start the
-			// proxy from the workspace you want the model to see).
+			// Tools run on the client (e.g. Cursor), not on this proxy. A real host
+			// cwd here only feeds Command Code's server-side workspace prompt and
+			// stacks another agent layer on top of the client's own system — which
+			// makes the model over-iterate. Prefer request/env override, else "/".
 			WorkingDir:    commandCodeWorkingDir(openaiPayload),
 			Date:          time.Now().UTC().Format("2006-01-02"),
 			Environment:   commandCodeEnvironment(),
@@ -83,9 +93,9 @@ func buildCommandCodeGenerateBody(model string, openaiPayload []byte) ([]byte, e
 		PermissionMode: "standard",
 		Mode:           "agent",
 		Params: commandCodeParams{
-			Model:       model,
-			Messages:    messages,
-			// Only forward tools from the client/agent request.
+			Model:    model,
+			Messages: messages,
+			// Only client-provided tools (empty slice disables upstream builtins).
 			Tools:       tools,
 			System:      system,
 			MaxTokens:   maxTokens,
@@ -111,18 +121,16 @@ func commandCodeWorkingDir(openaiPayload []byte) string {
 			return v
 		}
 	}
-	cwd, _ := os.Getwd()
-	if cwd == "" {
-		cwd = "."
-	}
-	return cwd
+	// Neutral placeholder — do not leak process cwd into upstream prompts.
+	return "/"
 }
 
 func commandCodeEnvironment() string {
 	if v := strings.TrimSpace(os.Getenv("COMMANDCODE_ENVIRONMENT")); v != "" {
 		return v
 	}
-	return fmt.Sprintf("%s %s", runtime.GOOS, runtime.GOARCH)
+	// Keep host OS out of upstream env-context injection unless explicitly set.
+	return "proxy"
 }
 
 func openaiMessagesToCommandCode(payload []byte) (messages []any, system string) {

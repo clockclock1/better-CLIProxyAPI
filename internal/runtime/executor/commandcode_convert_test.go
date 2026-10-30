@@ -2,11 +2,10 @@ package executor
 
 import (
 	"encoding/json"
-	"os"
 	"testing"
 )
 
-func TestBuildCommandCodeGenerateBodyUsesProcessCwd(t *testing.T) {
+func TestBuildCommandCodeGenerateBodyNeutralWorkspace(t *testing.T) {
 	payload := []byte(`{
 		"model":"deepseek/deepseek-v4.1-flash",
 		"messages":[{"role":"user","content":"你好"}],
@@ -27,12 +26,20 @@ func TestBuildCommandCodeGenerateBodyUsesProcessCwd(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatal(err)
 	}
-	cwd, _ := os.Getwd()
-	if body.Config.WorkingDir != cwd {
-		t.Fatalf("workingDir = %q, want process cwd %q", body.Config.WorkingDir, cwd)
+	if body.Config.WorkingDir != "/" {
+		t.Fatalf("workingDir = %q, want neutral /", body.Config.WorkingDir)
 	}
-	if body.Params.System != "" {
-		t.Fatalf("system should stay empty when client sent none, got %q", body.Params.System)
+	if body.Params.System != commandCodeNeutralSystem {
+		t.Fatalf("system should use neutral suppressor when client sent none, got %q", body.Params.System)
+	}
+	if body.Config.IsGitRepo || len(body.Config.Structure) != 0 || body.Config.GitStatus != "" {
+		t.Fatalf("workspace prompt fields must stay empty: %+v", body.Config)
+	}
+	if body.Config.Environment != "proxy" {
+		t.Fatalf("environment = %q, want proxy", body.Config.Environment)
+	}
+	if body.Memory != nil || body.Taste != nil || body.Skills != nil {
+		t.Fatalf("memory/taste/skills must be nil, got memory=%v taste=%v skills=%v", body.Memory, body.Taste, body.Skills)
 	}
 	if len(body.Params.Tools) != 1 {
 		t.Fatalf("tools = %#v, want only client tool", body.Params.Tools)
