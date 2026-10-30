@@ -2,10 +2,11 @@ package executor
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 )
 
-func TestBuildCommandCodeGenerateBodyNeutralizesWorkspace(t *testing.T) {
+func TestBuildCommandCodeGenerateBodyUsesProcessCwd(t *testing.T) {
 	payload := []byte(`{
 		"model":"deepseek/deepseek-v4.1-flash",
 		"messages":[{"role":"user","content":"你好"}],
@@ -26,17 +27,12 @@ func TestBuildCommandCodeGenerateBodyNeutralizesWorkspace(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Config.WorkingDir != "/" {
-		t.Fatalf("workingDir = %q, want /", body.Config.WorkingDir)
+	cwd, _ := os.Getwd()
+	if body.Config.WorkingDir != cwd {
+		t.Fatalf("workingDir = %q, want process cwd %q", body.Config.WorkingDir, cwd)
 	}
-	if body.Config.Environment != "proxy" {
-		t.Fatalf("environment = %q, want proxy", body.Config.Environment)
-	}
-	if body.Config.IsGitRepo || body.Config.GitStatus != "" || len(body.Config.RecentCommits) != 0 {
-		t.Fatalf("unexpected git context: %+v", body.Config)
-	}
-	if body.Params.System != commandCodeNeutralSystem {
-		t.Fatalf("system = %q, want neutral suppressor", body.Params.System)
+	if body.Params.System != "" {
+		t.Fatalf("system should stay empty when client sent none, got %q", body.Params.System)
 	}
 	if len(body.Params.Tools) != 1 {
 		t.Fatalf("tools = %#v, want only client tool", body.Params.Tools)
@@ -47,7 +43,7 @@ func TestBuildCommandCodeGenerateBodyNeutralizesWorkspace(t *testing.T) {
 	}
 }
 
-func TestBuildCommandCodeGenerateBodyKeepsClientSystemAndNoBuiltinTools(t *testing.T) {
+func TestBuildCommandCodeGenerateBodyKeepsClientSystem(t *testing.T) {
 	payload := []byte(`{
 		"model":"deepseek/deepseek-v4.1-flash",
 		"messages":[
@@ -68,9 +64,6 @@ func TestBuildCommandCodeGenerateBodyKeepsClientSystemAndNoBuiltinTools(t *testi
 	}
 	if body.Params.Tools == nil || len(body.Params.Tools) != 0 {
 		t.Fatalf("tools = %#v, want empty client tool list", body.Params.Tools)
-	}
-	if body.Config.WorkingDir != "/" {
-		t.Fatalf("workingDir = %q", body.Config.WorkingDir)
 	}
 }
 
