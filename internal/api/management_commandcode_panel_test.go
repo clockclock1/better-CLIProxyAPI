@@ -57,13 +57,23 @@ func TestPatchManagementHTMLForCommandCode(t *testing.T) {
 }
 
 func TestPatchManagementHTMLInjectsAPIKeyImport(t *testing.T) {
-	raw := []byte("startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}")
+	raw := []byte(strings.Join([]string{
+		"devin_oauth_title:`Devin OAuth`,devin_oauth_button:`开始 Devin 登录`",
+		"devin_oauth_title:`Devin OAuth`,devin_oauth_button:`Start Devin Login`",
+		"startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}",
+	}, ""))
 	out := string(patchManagementHTMLForCommandCode(raw))
 	if !strings.Contains(out, "oauth/import?provider=commandcode") {
 		t.Fatalf("missing commandcode API key import patch:\n%s", out)
 	}
 	if !strings.Contains(out, "粘贴 Command Code API Key") {
 		t.Fatal("missing Chinese API key prompt text")
+	}
+	if !strings.Contains(out, "commandcode_oauth_status_error:`Command Code 认证失败：`") {
+		t.Fatal("missing zh status error i18n")
+	}
+	if !strings.Contains(out, "commandcode_oauth_button:`Start Command Code Login`") {
+		t.Fatal("missing en button i18n")
 	}
 }
 

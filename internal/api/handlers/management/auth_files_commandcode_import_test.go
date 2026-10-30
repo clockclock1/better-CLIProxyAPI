@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -33,6 +34,21 @@ func TestImportCommandCodeAPIKey(t *testing.T) {
 	}
 	if resp["status"] != "ok" {
 		t.Fatalf("resp = %#v", resp)
+	}
+	state, _ := resp["state"].(string)
+	if state == "" {
+		t.Fatalf("import must return state for Management UI polling, got %#v", resp)
+	}
+	_, _, _, _, completed, okSession := GetOAuthSessionDetails(state)
+	if !okSession || !completed {
+		t.Fatalf("expected completed oauth session, ok=%v completed=%v", okSession, completed)
+	}
+	router.GET("/get-auth-status", h.GetAuthStatus)
+	wStatus := httptest.NewRecorder()
+	reqStatus := httptest.NewRequest(http.MethodGet, "/get-auth-status?state="+state, nil)
+	router.ServeHTTP(wStatus, reqStatus)
+	if wStatus.Code != http.StatusOK || !strings.Contains(wStatus.Body.String(), `"status":"ok"`) {
+		t.Fatalf("auth status after import: %d %s", wStatus.Code, wStatus.Body.String())
 	}
 
 	w2 := httptest.NewRecorder()

@@ -128,14 +128,28 @@ func (h *Handler) ImportCommandCodeAPIKey(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": errRecord.Error()})
 		return
 	}
+
+	// Management UI always polls getAuthStatus(state) after startAuth; return a
+	// completed session so the modal can finish without missing_state.
+	state, errState := misc.GenerateRandomState()
+	if errState != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
+		return
+	}
+	RegisterOAuthSession(state, "commandcode")
+
 	ctx := PopulateAuthContext(context.Background(), c)
 	savedPath, errSave := h.saveTokenRecord(ctx, record)
 	if errSave != nil {
+		SetOAuthSessionError(state, "Failed to save authentication tokens")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save authentication tokens"})
 		return
 	}
+	CompleteOAuthSession(state)
 	c.JSON(http.StatusOK, gin.H{
 		"status":   "ok",
+		"url":      "https://commandcode.ai/",
+		"state":    state,
 		"path":     savedPath,
 		"filename": record.FileName,
 		"label":    record.Label,
