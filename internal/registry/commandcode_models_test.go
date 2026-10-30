@@ -1,6 +1,9 @@
 package registry
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestGetCommandCodeModelsCatalog(t *testing.T) {
 	models := GetCommandCodeModels()
@@ -30,5 +33,43 @@ func TestGetCommandCodeModelsCatalog(t *testing.T) {
 		if !found {
 			t.Fatalf("missing model %s", id)
 		}
+	}
+}
+
+func TestValidateCommandCodeModelsJSONProviderPayload(t *testing.T) {
+	payload := map[string]any{
+		"object": "list",
+		"data": []map[string]any{
+			{"id": "claude-sonnet-5-5", "object": "model", "owned_by": "command-code", "name": "Claude Sonnet 5.5", "context_length": 1000000},
+			{"id": "poolside/laguna-s-2.1-free", "object": "model", "owned_by": "command-code", "name": "Laguna"},
+		},
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, errValidate := ValidateCommandCodeModelsJSON(raw)
+	if errValidate != nil {
+		t.Fatalf("ValidateCommandCodeModelsJSON: %v", errValidate)
+	}
+	if len(models) != 2 {
+		t.Fatalf("len=%d", len(models))
+	}
+	if models[0].DisplayName != "Claude Sonnet 5.5" || models[0].ContextLength != 1000000 {
+		t.Fatalf("unexpected first model: %+v", models[0])
+	}
+	changed, errLoad := loadCommandCodeModelsFromBytes(raw, "test")
+	if errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	if !changed {
+		t.Fatal("expected catalog change on first load")
+	}
+	changedAgain, errLoadAgain := loadCommandCodeModelsFromBytes(raw, "test")
+	if errLoadAgain != nil {
+		t.Fatal(errLoadAgain)
+	}
+	if changedAgain {
+		t.Fatal("identical payload should not bump revision")
 	}
 }

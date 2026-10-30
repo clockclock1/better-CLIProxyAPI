@@ -367,6 +367,10 @@ func (s *Service) registerModelRefreshCallback() {
 					providerSet["kimi-ai"] = true
 					providerSet["kimi.ai"] = true
 					providerSet["kimi.com"] = true
+				case "commandcode", "command-code", "command_code":
+					providerSet["commandcode"] = true
+					providerSet["command-code"] = true
+					providerSet["command_code"] = true
 				}
 			}
 		}

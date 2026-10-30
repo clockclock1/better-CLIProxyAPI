@@ -91,12 +91,13 @@ type CatalogSourceStatus struct {
 
 // CatalogRefreshResult reports the outcome of an on-demand model catalog refresh.
 type CatalogRefreshResult struct {
-	Catalog          string                         `json:"catalog"`
-	CodexCatalog     string                         `json:"codex_catalog"`
-	DevinCatalog     string                         `json:"devin_catalog"`
-	Sources          CatalogSources                 `json:"sources"`
-	Catalogs         map[string]CatalogSourceStatus `json:"catalogs"`
-	ChangedProviders []string                       `json:"changed_providers"`
+	Catalog            string                         `json:"catalog"`
+	CodexCatalog       string                         `json:"codex_catalog"`
+	DevinCatalog       string                         `json:"devin_catalog"`
+	CommandCodeCatalog string                         `json:"commandcode_catalog"`
+	Sources            CatalogSources                 `json:"sources"`
+	Catalogs           map[string]CatalogSourceStatus `json:"catalogs"`
+	ChangedProviders   []string                       `json:"changed_providers"`
 }
 
 func (u *catalogUpdater) refresh(ctx context.Context, source string, generation uint64) {
@@ -370,6 +371,19 @@ var devinCatalogUpdater = &catalogUpdater{
 		return nil, errLoad
 	},
 }
+var commandCodeCatalogUpdater = &catalogUpdater{
+	fetchWithSource: func(ctx context.Context, source string) ([]byte, string, error) {
+		commandCodeModelsURLs = defaultCommandCodeModelURLs()
+		return dynamicCatalogFetcherWithSource(embeddedCommandCodeModelsJSON, &commandCodeModelsURLs, validateCommandCodeCatalogBytes)(ctx, source)
+	},
+	publish: func(data []byte) ([]string, error) {
+		changed, errLoad := loadCommandCodeModelsFromBytes(data, "catalog")
+		if errLoad == nil && changed {
+			return []string{"commandcode"}, nil
+		}
+		return nil, errLoad
+	},
+}
 
 var catalogRuntime struct {
 	sync.Mutex
@@ -437,15 +451,17 @@ func RefreshModelCatalogsWithPolicy(ctx context.Context, fallbackSources Catalog
 
 	effectiveFallback := effectiveCatalogSources(fallbackSources, local, fallbackHome)
 	var (
-		generalStatus CatalogSourceStatus
-		codexStatus   CatalogSourceStatus
-		devinStatus   CatalogSourceStatus
-		errGeneral    error
-		errCodex      error
-		errDevin      error
-		wg            sync.WaitGroup
+		generalStatus     CatalogSourceStatus
+		codexStatus       CatalogSourceStatus
+		devinStatus       CatalogSourceStatus
+		commandCodeStatus CatalogSourceStatus
+		errGeneral        error
+		errCodex          error
+		errDevin          error
+		errCommandCode    error
+		wg                sync.WaitGroup
 	)
-	wg.Add(3)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		generalStatus, errGeneral = generalCatalogUpdater.refreshOnDemand(ctx, effectiveFallback.Catalog, modelsURLs)
@@ -458,33 +474,42 @@ func RefreshModelCatalogsWithPolicy(ctx context.Context, fallbackSources Catalog
 		defer wg.Done()
 		devinStatus, errDevin = devinCatalogUpdater.refreshOnDemand(ctx, effectiveFallback.DevinCatalog, devinModelsURLs)
 	}()
+	go func() {
+		defer wg.Done()
+		commandCodeModelsURLs = defaultCommandCodeModelURLs()
+		commandCodeStatus, errCommandCode = commandCodeCatalogUpdater.refreshOnDemand(ctx, effectiveFallback.CommandCodeCatalog, commandCodeModelsURLs)
+	}()
 	wg.Wait()
 
 	var changed []string
 	changed = mergeProviderNames(changed, generalStatus.ChangedProviders)
 	changed = mergeProviderNames(changed, codexStatus.ChangedProviders)
 	changed = mergeProviderNames(changed, devinStatus.ChangedProviders)
+	changed = mergeProviderNames(changed, commandCodeStatus.ChangedProviders)
 	if changed == nil {
 		changed = []string{}
 	}
 
 	result := CatalogRefreshResult{
-		Catalog:      generalStatus.Source,
-		CodexCatalog: codexStatus.Source,
-		DevinCatalog: devinStatus.Source,
+		Catalog:            generalStatus.Source,
+		CodexCatalog:       codexStatus.Source,
+		DevinCatalog:       devinStatus.Source,
+		CommandCodeCatalog: commandCodeStatus.Source,
 		Sources: CatalogSources{
-			Catalog:      generalStatus.Source,
-			CodexCatalog: codexStatus.Source,
-			DevinCatalog: devinStatus.Source,
+			Catalog:            generalStatus.Source,
+			CodexCatalog:       codexStatus.Source,
+			DevinCatalog:       devinStatus.Source,
+			CommandCodeCatalog: commandCodeStatus.Source,
 		},
 		Catalogs: map[string]CatalogSourceStatus{
-			"catalog":       generalStatus,
-			"codex-catalog": codexStatus,
-			"devin-catalog": devinStatus,
+			"catalog":             generalStatus,
+			"codex-catalog":       codexStatus,
+			"devin-catalog":       devinStatus,
+			"commandcode-catalog": commandCodeStatus,
 		},
 		ChangedProviders: changed,
 	}
-	return result, errors.Join(errGeneral, errCodex, errDevin)
+	return result, errors.Join(errGeneral, errCodex, errDevin, errCommandCode)
 }
 
 func configureCatalogs(ctx context.Context, sources CatalogSources, local, home bool) {
@@ -493,9 +518,11 @@ func configureCatalogs(ctx context.Context, sources CatalogSources, local, home 
 		return
 	}
 	sources = effectiveCatalogSources(sources, local, home)
+	commandCodeModelsURLs = defaultCommandCodeModelURLs()
 	generalCatalogUpdater.configure(ctx, sources.Catalog)
 	codexCatalogUpdater.configure(ctx, sources.CodexCatalog)
 	devinCatalogUpdater.configure(ctx, sources.DevinCatalog)
+	commandCodeCatalogUpdater.configure(ctx, sources.CommandCodeCatalog)
 }
 
 func effectiveCatalogSources(sources CatalogSources, local, home bool) CatalogSources {
@@ -507,11 +534,18 @@ func effectiveCatalogSources(sources CatalogSources, local, home bool) CatalogSo
 	}
 	general := selectSource(sources.Catalog)
 	devin := selectSource(sources.DevinCatalog)
+	commandCode := selectSource(sources.CommandCodeCatalog)
 	if home {
 		general = "disabled"
 		devin = "disabled"
+		commandCode = "disabled"
 	}
-	return CatalogSources{Catalog: general, CodexCatalog: selectSource(sources.CodexCatalog), DevinCatalog: devin}
+	return CatalogSources{
+		Catalog:            general,
+		CodexCatalog:       selectSource(sources.CodexCatalog),
+		DevinCatalog:       devin,
+		CommandCodeCatalog: commandCode,
+	}
 }
 
 func validateDevinCatalogBytes(data []byte) error {

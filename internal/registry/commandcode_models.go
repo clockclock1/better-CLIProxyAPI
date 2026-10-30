@@ -1,1204 +1,299 @@
 package registry
 
-// GetCommandCodeModels returns the Command Code model catalog (provider /v1/models).
-// These map to POST /alpha/generate via the Command Code executor.
+import (
+	"bytes"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+
+	log "github.com/sirupsen/logrus"
+)
+
+//go:embed models/commandcode_models.json
+var embeddedCommandCodeModelsJSON []byte
+
+type commandCodeModelsStore struct {
+	mu       sync.RWMutex
+	models   []*ModelInfo
+	rawJSON  []byte
+	revision uint64
+}
+
+var commandCodeCatalogStore = &commandCodeModelsStore{}
+
+func init() {
+	if _, err := loadCommandCodeModelsFromBytes(embeddedCommandCodeModelsJSON, "embed"); err != nil {
+		log.Warnf("registry: failed to parse embedded commandcode_models.json (will rely on static fallback and remote refresh): %v", err)
+	}
+}
+
+// GetCommandCodeModels returns the active Command Code model catalog.
+// Prefers the dynamically refreshed / embedded catalog, then the static fallback.
 func GetCommandCodeModels() []*ModelInfo {
+	commandCodeCatalogStore.mu.RLock()
+	models := commandCodeCatalogStore.models
+	commandCodeCatalogStore.mu.RUnlock()
+	if len(models) > 0 {
+		return cloneModelInfos(models)
+	}
 	return cloneModelInfos(staticCommandCodeModels)
 }
 
+// GetCommandCodeModelsRevision returns the revision counter of the Command Code catalog.
+func GetCommandCodeModelsRevision() uint64 {
+	commandCodeCatalogStore.mu.RLock()
+	defer commandCodeCatalogStore.mu.RUnlock()
+	return commandCodeCatalogStore.revision
+}
+
+// GetCommandCodeModelsSnapshot returns a copy of raw JSON and current catalog revision.
+func GetCommandCodeModelsSnapshot() ([]byte, uint64) {
+	commandCodeCatalogStore.mu.RLock()
+	defer commandCodeCatalogStore.mu.RUnlock()
+	return append([]byte(nil), commandCodeCatalogStore.rawJSON...), commandCodeCatalogStore.revision
+}
+
+func loadCommandCodeModelsFromBytes(data []byte, source string) (bool, error) {
+	models, err := ValidateCommandCodeModelsJSON(data)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", source, err)
+	}
+	clonedData := append([]byte(nil), data...)
+	commandCodeCatalogStore.mu.Lock()
+	if bytes.Equal(commandCodeCatalogStore.rawJSON, clonedData) {
+		commandCodeCatalogStore.mu.Unlock()
+		return false, nil
+	}
+	commandCodeCatalogStore.models = models
+	commandCodeCatalogStore.rawJSON = clonedData
+	commandCodeCatalogStore.revision++
+	commandCodeCatalogStore.mu.Unlock()
+	return true, nil
+}
+
+type commandCodeProviderModelsPayload struct {
+	Object string                        `json:"object"`
+	Data   []commandCodeProviderModelRaw `json:"data"`
+}
+
+type commandCodeProviderModelRaw struct {
+	ID                  string   `json:"id"`
+	Object              string   `json:"object"`
+	Created             int64    `json:"created"`
+	OwnedBy             string   `json:"owned_by"`
+	Name                string   `json:"name"`
+	DisplayName         string   `json:"display_name"`
+	ContextLength       int      `json:"context_length"`
+	MaxCompletionTokens int      `json:"max_completion_tokens"`
+	SupportedEndpoints  []string `json:"supported_endpoints"`
+}
+
+type commandCodeModelsFilePayload struct {
+	CommandCode []*ModelInfo `json:"commandcode,omitempty"`
+	Models      []*ModelInfo `json:"models,omitempty"`
+}
+
+// ValidateCommandCodeModelsJSON parses provider /v1/models, {commandcode:[...]}, or a ModelInfo array.
+func ValidateCommandCodeModelsJSON(data []byte) ([]*ModelInfo, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("empty Command Code models payload")
+	}
+
+	var providerPayload commandCodeProviderModelsPayload
+	if err := json.Unmarshal(trimmed, &providerPayload); err == nil && len(providerPayload.Data) > 0 {
+		out := make([]*ModelInfo, 0, len(providerPayload.Data))
+		seen := make(map[string]struct{}, len(providerPayload.Data))
+		for _, raw := range providerPayload.Data {
+			info := commandCodeModelInfoFromProvider(raw)
+			if info == nil {
+				continue
+			}
+			id := strings.TrimSpace(info.ID)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, info)
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("Command Code provider models payload contained no usable models")
+		}
+		return out, nil
+	}
+
+	var envelope commandCodeModelsFilePayload
+	if err := json.Unmarshal(trimmed, &envelope); err == nil {
+		candidates := envelope.CommandCode
+		if len(candidates) == 0 {
+			candidates = envelope.Models
+		}
+		if len(candidates) > 0 {
+			return normalizeCommandCodeModelInfos(candidates)
+		}
+	}
+
+	var direct []*ModelInfo
+	if err := json.Unmarshal(trimmed, &direct); err == nil && len(direct) > 0 {
+		return normalizeCommandCodeModelInfos(direct)
+	}
+	return nil, fmt.Errorf("unrecognized Command Code models payload")
+}
+
+func normalizeCommandCodeModelInfos(in []*ModelInfo) ([]*ModelInfo, error) {
+	out := make([]*ModelInfo, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, m := range in {
+		if m == nil {
+			continue
+		}
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		cloned := cloneModelInfo(m)
+		if cloned.Object == "" {
+			cloned.Object = "model"
+		}
+		if cloned.OwnedBy == "" {
+			cloned.OwnedBy = "command-code"
+		}
+		cloned.Type = "commandcode"
+		if cloned.DisplayName == "" {
+			cloned.DisplayName = commandCodeDisplayName(id)
+		}
+		if cloned.ContextLength <= 0 {
+			cloned.ContextLength = 200000
+		}
+		if cloned.InputTokenLimit <= 0 {
+			cloned.InputTokenLimit = cloned.ContextLength
+		}
+		if cloned.OutputTokenLimit <= 0 {
+			cloned.OutputTokenLimit = 8192
+		}
+		if cloned.MaxCompletionTokens <= 0 {
+			cloned.MaxCompletionTokens = cloned.OutputTokenLimit
+		}
+		if len(cloned.SupportedInputModalities) == 0 {
+			cloned.SupportedInputModalities = commandCodeInputModalities(id)
+		}
+		if len(cloned.SupportedOutputModalities) == 0 {
+			cloned.SupportedOutputModalities = []string{"text"}
+		}
+		if len(cloned.SupportedGenerationMethods) == 0 {
+			cloned.SupportedGenerationMethods = []string{"generateContent"}
+		}
+		out = append(out, cloned)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("Command Code models payload contained no usable models")
+	}
+	return out, nil
+}
+
+func commandCodeModelInfoFromProvider(raw commandCodeProviderModelRaw) *ModelInfo {
+	id := strings.TrimSpace(raw.ID)
+	if id == "" {
+		return nil
+	}
+	display := strings.TrimSpace(raw.DisplayName)
+	if display == "" {
+		display = strings.TrimSpace(raw.Name)
+	}
+	if display == "" {
+		display = commandCodeDisplayName(id)
+	}
+	ctxLen := raw.ContextLength
+	if ctxLen <= 0 {
+		ctxLen = 200000
+	}
+	outTokens := raw.MaxCompletionTokens
+	if outTokens <= 0 {
+		outTokens = 8192
+	}
+	return &ModelInfo{
+		ID:                         id,
+		Object:                     "model",
+		Created:                    raw.Created,
+		OwnedBy:                    firstNonEmptyString(strings.TrimSpace(raw.OwnedBy), "command-code"),
+		Type:                       "commandcode",
+		DisplayName:                display,
+		ContextLength:              ctxLen,
+		MaxCompletionTokens:        outTokens,
+		InputTokenLimit:            ctxLen,
+		OutputTokenLimit:           outTokens,
+		SupportedInputModalities:   commandCodeInputModalities(id),
+		SupportedOutputModalities:  []string{"text"},
+		SupportedGenerationMethods: []string{"generateContent"},
+	}
+}
+
+func commandCodeDisplayName(id string) string {
+	base := id
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	base = strings.TrimSuffix(base, ":free")
+	parts := strings.FieldsFunc(base, func(r rune) bool { return r == '-' || r == '_' })
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		if strings.ToUpper(p) == p && len(p) <= 3 {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+func commandCodeInputModalities(id string) []string {
+	lower := strings.ToLower(id)
+	if strings.Contains(lower, "vision") ||
+		strings.Contains(lower, "omni") ||
+		strings.Contains(lower, "gemini") ||
+		strings.HasPrefix(lower, "gpt-") ||
+		strings.HasPrefix(lower, "claude-") ||
+		strings.Contains(lower, "glyph") ||
+		strings.Contains(lower, "beam") ||
+		strings.Contains(lower, "laguna") ||
+		strings.Contains(lower, "muse") ||
+		strings.Contains(lower, "grok") ||
+		strings.Contains(lower, "fugu") ||
+		strings.Contains(lower, "nemotron") ||
+		strings.Contains(lower, "hy3") ||
+		strings.Contains(lower, "hy4") {
+		return []string{"text", "image"}
+	}
+	return []string{"text"}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// staticCommandCodeModels is the last-resort hardcoded fallback if embed/remote catalogs are unavailable.
 var staticCommandCodeModels = []*ModelInfo{
 	{
-		ID:                         "claude-sonnet-5-5",
+		ID:                         "poolside/laguna-s-2.1-free",
 		Object:                     "model",
-		Created:                    1793324526,
 		OwnedBy:                    "command-code",
 		Type:                       "commandcode",
-		DisplayName:                "Claude Sonnet 5 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-sonnet-5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Sonnet 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-sonnet-4-6",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Sonnet 4 6",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-fable-5-1",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Fable 5 1",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-fable-5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Fable 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-opus-5-5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Opus 5 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-opus-5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Opus 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-opus-4-8",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Opus 4 8",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-opus-4-7",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Opus 4 7",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-haiku-5-5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Haiku 5 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "claude-haiku-4-5-20251001",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Claude Haiku 4 5 20251001",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-6-astra",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 6 Astra",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-6.1-sol",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 6.1 Sol",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-6.1-terra",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 6.1 Terra",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-6-sol",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 6 Sol",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-6-luna",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 6 Luna",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.6-sol",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.6 Sol",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.6-terra",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.6 Terra",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.6-luna",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.6 Luna",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.4",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.4",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.3-codex",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.3 Codex",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "gpt-5.4-mini",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gpt 5.4 Mini",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "deepseek/deepseek-v4-pro",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Deepseek V4 Pro",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "deepseek/deepseek-v4-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Deepseek V4 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "deepseek/deepseek-v4-flash-vision-exp",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Deepseek V4 Flash Vision Exp",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "deepseek/deepseek-v4-flash-fast",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Deepseek V4 Flash Fast",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "deepseek/deepseek-v4.1-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Deepseek V4.1 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "deepseek/deepseek-v4.1-flash-fast",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Deepseek V4.1 Flash Fast",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "moonshotai/Kimi-K3.1-Pro",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Kimi K3.1 Pro",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "moonshotai/Kimi-K3",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Kimi K3",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "moonshotai/Kimi-K2.7-Code",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Kimi K2.7 Code",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "moonshotai/Kimi-K2.7-Code-Highspeed",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Kimi K2.7 Code Highspeed",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "moonshotai/Kimi-K2.6",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Kimi K2.6",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "moonshotai/Kimi-K2.5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Kimi K2.5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "z-ai/glm-5.3-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Glm 5.3 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "z-ai/glm-5.3-flashx",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Glm 5.3 Flashx",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "zai-org/GLM-5.3",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "GLM 5.3",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "zai-org/GLM-5.2",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "GLM 5.2",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "zai-org/GLM-5.2-Fast",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "GLM 5.2 Fast",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "zai-org/GLM-5.1",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "GLM 5.1",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "zai-org/GLM-5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "GLM 5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "minimax/minimax-m3.1-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Minimax M3.1 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "MiniMaxAI/MiniMax-M3",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "MiniMax M3",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "MiniMaxAI/MiniMax-M2.7",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "MiniMax M2.7",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "MiniMaxAI/MiniMax-M2.5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "MiniMax M2.5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "ornith/ornith-1.5-122b",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Ornith 1.5 122b",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "xiaomi/mimo-v2.6-pro",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Mimo V2.6 Pro",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "xiaomi/mimo-v2.6-pro-ultraspeed",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Mimo V2.6 Pro Ultraspeed",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "xiaomi/mimo-v2.6-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Mimo V2.6 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.8-Omni-Flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.8 Omni Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.8-Max-Prime",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.8 Max Prime",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.8-Max-0902",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.8 Max 0902",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.8-Max",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.8 Max",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.8-27B",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.8 27B",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.8-Flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.8 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.7-Max",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.7 Max",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.7-Plus",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.7 Plus",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.7-Flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.7 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.6-Max-Preview",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.6 Max Preview",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "Qwen/Qwen3.6-Plus",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Qwen3.6 Plus",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meituan/LongCat-2.0",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "LongCat 2.0",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "stepfun/Step-5-Preview",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Step 5 Preview",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "stepfun/Step-3.7-Flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Step 3.7 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "stepfun/Step-3.5-Flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Step 3.5 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "tencent/hy3-paid",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Hy3 Paid",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "tencent/hy4-preview",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Hy4 Preview",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-4-argon",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 4 Argon",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-3.8-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 3.8 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-3.7-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 3.7 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-3.6-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 3.6 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-3.5-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 3.5 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-3.5-flash-lite",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 3.5 Flash Lite",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "google/gemini-3.1-flash-lite",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Gemini 3.1 Flash Lite",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "sakana/fugu-ultra",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Fugu Ultra",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "nvidia/nemotron-3-ultra-550b-a55b",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Nemotron 3 Ultra 550b A55b",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "nvidia/nemotron-3.5-super-vl",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Nemotron 3.5 Super Vl",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "thinkingmachines/inkling",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Inkling",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "thinkingmachines/inkling-small",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Inkling Small",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "stealth/glyph-cluster:free",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Glyph Cluster",
+		DisplayName:                "Laguna S 2.1 (Free)",
 		ContextLength:              200000,
 		MaxCompletionTokens:        8192,
 		InputTokenLimit:            200000,
@@ -1210,10 +305,9 @@ var staticCommandCodeModels = []*ModelInfo{
 	{
 		ID:                         "reflection/beam:free",
 		Object:                     "model",
-		Created:                    1793324526,
 		OwnedBy:                    "command-code",
 		Type:                       "commandcode",
-		DisplayName:                "Beam",
+		DisplayName:                "Beam (Free)",
 		ContextLength:              200000,
 		MaxCompletionTokens:        8192,
 		InputTokenLimit:            200000,
@@ -1223,197 +317,16 @@ var staticCommandCodeModels = []*ModelInfo{
 		SupportedGenerationMethods: []string{"generateContent"},
 	},
 	{
-		ID:                         "poolside/laguna-s-2.1-free",
+		ID:                         "stealth/glyph-cluster:free",
 		Object:                     "model",
-		Created:                    1793324526,
 		OwnedBy:                    "command-code",
 		Type:                       "commandcode",
-		DisplayName:                "Laguna S 2.1 Free",
+		DisplayName:                "Glyph Cluster (Free)",
 		ContextLength:              200000,
 		MaxCompletionTokens:        8192,
 		InputTokenLimit:            200000,
 		OutputTokenLimit:           8192,
 		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "inclusionai/ling-3.1-flash",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Ling 3.1 Flash",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-spark-1.1",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Spark 1.1",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-spark-1.2",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Spark 1.2",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-spark-1.2-contributor",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Spark 1.2 Contributor",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-spark-1.3",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Spark 1.3",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-spark-1.3-contributor",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Spark 1.3 Contributor",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-spark-open",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Spark Open",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "meta/muse-wonder-1.0",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Muse Wonder 1.0",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "xai/grok-4.5",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Grok 4.5",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "xai/grok-4.6",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Grok 4.6",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "xai/grok-4.7",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Grok 4.7",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text", "image"},
-		SupportedOutputModalities:  []string{"text"},
-		SupportedGenerationMethods: []string{"generateContent"},
-	},
-	{
-		ID:                         "mistral/mistral-large-4",
-		Object:                     "model",
-		Created:                    1793324526,
-		OwnedBy:                    "command-code",
-		Type:                       "commandcode",
-		DisplayName:                "Mistral Large 4",
-		ContextLength:              200000,
-		MaxCompletionTokens:        8192,
-		InputTokenLimit:            200000,
-		OutputTokenLimit:           8192,
-		SupportedInputModalities:   []string{"text"},
 		SupportedOutputModalities:  []string{"text"},
 		SupportedGenerationMethods: []string{"generateContent"},
 	},

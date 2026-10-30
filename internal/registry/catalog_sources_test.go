@@ -24,6 +24,7 @@ func TestCatalogFetcherSources(t *testing.T) {
 		{"general", embeddedModelsJSON, validateCatalogBytes},
 		{"codex", embeddedCodexClientModelsJSON, ValidateCodexClientModelsJSON},
 		{"devin", embeddedDevinModelsJSON, validateDevinCatalogBytes},
+		{"commandcode", embeddedCommandCodeModelsJSON, validateCommandCodeCatalogBytes},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var officialHits atomic.Int32
@@ -133,10 +134,12 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 	oldModels := getModels()
 	oldCodex, _ := GetCodexClientModelsSnapshot()
 	oldDevin, _ := GetDevinModelsSnapshot()
+	oldCommandCode, _ := GetCommandCodeModelsSnapshot()
 	oldModelsURLs := modelsURLs
 	oldGeneralPublish := generalCatalogUpdater.publish
 	oldCodexPublish := codexCatalogUpdater.publish
 	oldDevinPublish := devinCatalogUpdater.publish
+	oldCommandCodePublish := commandCodeCatalogUpdater.publish
 	catalogRuntime.Lock()
 	oldCtx, oldLocal, oldSources, oldHome := catalogRuntime.ctx, catalogRuntime.local, catalogRuntime.sources, catalogRuntime.home
 	catalogRuntime.Unlock()
@@ -160,6 +163,7 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 		modelsCatalogStore.mu.Unlock()
 		_, _ = loadCodexClientModelsFromBytes(oldCodex, "restore")
 		_, _ = loadDevinModelsFromBytes(oldDevin, "restore")
+		_, _ = loadCommandCodeModelsFromBytes(oldCommandCode, "restore")
 		SetLocalModelCatalogs(oldLocal)
 		generalCatalogUpdater.mu.Lock()
 		if generalCatalogUpdater.cancel != nil {
@@ -188,6 +192,15 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 		devinCatalogUpdater.source = ""
 		devinCatalogUpdater.publish = oldDevinPublish
 		devinCatalogUpdater.mu.Unlock()
+		commandCodeCatalogUpdater.mu.Lock()
+		if commandCodeCatalogUpdater.cancel != nil {
+			commandCodeCatalogUpdater.cancel()
+		}
+		commandCodeCatalogUpdater.cancel = nil
+		commandCodeCatalogUpdater.ctx = nil
+		commandCodeCatalogUpdater.source = ""
+		commandCodeCatalogUpdater.publish = oldCommandCodePublish
+		commandCodeCatalogUpdater.mu.Unlock()
 		modelsURLs = oldModelsURLs
 		catalogRuntime.Lock()
 		catalogRuntime.ctx = oldCtx
@@ -202,6 +215,7 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 	generalPublished := make(chan struct{}, 8)
 	codexPublished := make(chan struct{}, 8)
 	devinPublished := make(chan struct{}, 8)
+	commandCodePublished := make(chan struct{}, 8)
 	generalCatalogUpdater.mu.Lock()
 	generalCatalogUpdater.publish = func(data []byte) ([]string, error) {
 		changed, errPub := oldGeneralPublish(data)
@@ -238,6 +252,18 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 		return changed, errPub
 	}
 	devinCatalogUpdater.mu.Unlock()
+	commandCodeCatalogUpdater.mu.Lock()
+	commandCodeCatalogUpdater.publish = func(data []byte) ([]string, error) {
+		changed, errPub := oldCommandCodePublish(data)
+		if errPub == nil {
+			select {
+			case commandCodePublished <- struct{}{}:
+			default:
+			}
+		}
+		return changed, errPub
+	}
+	commandCodeCatalogUpdater.mu.Unlock()
 
 	var generalPayload atomic.Value
 	generalPayload.Store(embeddedModelsJSON)
@@ -264,14 +290,24 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 	}))
 	defer devinSrv.Close()
 
+	var commandCodePayload atomic.Value
+	commandCodePayload.Store(embeddedCommandCodeModelsJSON)
+	var commandCodeHits atomic.Int32
+	commandCodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		commandCodeHits.Add(1)
+		_, _ = w.Write(commandCodePayload.Load().([]byte))
+	}))
+	defer commandCodeSrv.Close()
+
 	SetLocalModelCatalogs(false)
 	sources := CatalogSources{
-		Catalog:      generalSrv.URL,
-		CodexCatalog: codexSrv.URL,
-		DevinCatalog: devinSrv.URL,
+		Catalog:            generalSrv.URL,
+		CodexCatalog:       codexSrv.URL,
+		DevinCatalog:       devinSrv.URL,
+		CommandCodeCatalog: commandCodeSrv.URL,
 	}
 	StartModelCatalogUpdaters(ctx, sources, false)
-	for _, ch := range []<-chan struct{}{generalPublished, codexPublished, devinPublished} {
+	for _, ch := range []<-chan struct{}{generalPublished, codexPublished, devinPublished, commandCodePublished} {
 		select {
 		case <-ch:
 		case <-time.After(5 * time.Second):
@@ -311,7 +347,7 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 	if errRefresh != nil {
 		t.Fatalf("RefreshModelCatalogs failed: %v", errRefresh)
 	}
-	if res.Catalog != generalSrv.URL || res.CodexCatalog != codexSrv.URL || res.DevinCatalog != devinSrv.URL {
+	if res.Catalog != generalSrv.URL || res.CodexCatalog != codexSrv.URL || res.DevinCatalog != devinSrv.URL || res.CommandCodeCatalog != commandCodeSrv.URL {
 		t.Fatalf("unexpected sources in result: %+v", res)
 	}
 	if !slices.Contains(res.ChangedProviders, "claude") || !slices.Contains(res.ChangedProviders, "devin") {
@@ -343,14 +379,15 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 	generalBefore := generalHits.Load()
 	codexBefore := codexHits.Load()
 	devinBefore := devinHits.Load()
+	commandCodeBefore := commandCodeHits.Load()
 	policyRes, errPolicy := RefreshModelCatalogs(ctx)
 	if errPolicy != nil {
 		t.Fatalf("RefreshModelCatalogs under local+Home policy failed: %v", errPolicy)
 	}
-	if policyRes.Catalog != "disabled" || policyRes.CodexCatalog != embeddedCatalogSource || policyRes.DevinCatalog != "disabled" {
+	if policyRes.Catalog != "disabled" || policyRes.CodexCatalog != embeddedCatalogSource || policyRes.DevinCatalog != "disabled" || policyRes.CommandCodeCatalog != "disabled" {
 		t.Fatalf("unexpected policy sources: %+v", policyRes)
 	}
-	if generalHits.Load() != generalBefore || codexHits.Load() != codexBefore || devinHits.Load() != devinBefore {
+	if generalHits.Load() != generalBefore || codexHits.Load() != codexBefore || devinHits.Load() != devinBefore || commandCodeHits.Load() != commandCodeBefore {
 		t.Fatal("RefreshModelCatalogs performed remote fetch for disabled or embedded catalogs")
 	}
 
@@ -435,7 +472,7 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 	}
 
 	// Verify credential notification fires immediately when one catalog publishes even if another is still fetching.
-	for _, ch := range []chan struct{}{generalPublished, codexPublished, devinPublished} {
+	for _, ch := range []chan struct{}{generalPublished, codexPublished, devinPublished, commandCodePublished} {
 		for len(ch) > 0 {
 			<-ch
 		}
@@ -460,11 +497,12 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 
 	SetLocalModelCatalogs(false)
 	UpdateModelCatalogSources(CatalogSources{
-		Catalog:      generalSrv.URL,
-		CodexCatalog: codexBlockSrv.URL,
-		DevinCatalog: devinSrv.URL,
+		Catalog:            generalSrv.URL,
+		CodexCatalog:       codexBlockSrv.URL,
+		DevinCatalog:       devinSrv.URL,
+		CommandCodeCatalog: commandCodeSrv.URL,
 	}, false)
-	for _, ch := range []<-chan struct{}{generalPublished, codexPublished, devinPublished} {
+	for _, ch := range []<-chan struct{}{generalPublished, codexPublished, devinPublished, commandCodePublished} {
 		select {
 		case <-ch:
 		case <-time.After(5 * time.Second):
@@ -507,16 +545,17 @@ func TestRefreshModelCatalogsOnDemand(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer brokenPrimary.Close()
-	for _, ch := range []chan struct{}{generalPublished, codexPublished, devinPublished} {
+	for _, ch := range []chan struct{}{generalPublished, codexPublished, devinPublished, commandCodePublished} {
 		for len(ch) > 0 {
 			<-ch
 		}
 	}
 	modelsURLs = []string{brokenPrimary.URL, generalSrv.URL}
 	UpdateModelCatalogSources(CatalogSources{
-		Catalog:      "",
-		CodexCatalog: codexSrv.URL,
-		DevinCatalog: devinSrv.URL,
+		Catalog:            "",
+		CodexCatalog:       codexSrv.URL,
+		DevinCatalog:       devinSrv.URL,
+		CommandCodeCatalog: commandCodeSrv.URL,
 	}, false)
 	for _, ch := range []<-chan struct{}{generalPublished, codexPublished} {
 		select {

@@ -65,7 +65,7 @@ func TestModelCatalogConfigRoundTrip(t *testing.T) {
 }
 
 func TestModelCatalogConfigValidation(t *testing.T) {
-	for _, field := range []string{"catalog", "codex-catalog", "devin-catalog"} {
+	for _, field := range []string{"catalog", "codex-catalog", "devin-catalog", "commandcode-catalog"} {
 		for _, source := range []string{"relative.json", "./models.json", "~/models.json", "ftp://example.com/models", "file:///tmp/models.json", "https:///models"} {
 			data := []byte(fmt.Sprintf("models:\n  %s: %q\n", field, source))
 			var cfg Config
