@@ -429,11 +429,17 @@ func usageFromCommandCodeTotal(event gjson.Result) map[string]any {
 	if cacheWrite == 0 {
 		cacheWrite = src.Get("cacheWriteTokens").Int()
 	}
-	// Upstream inputTokens excludes cache read/write, matching the CLI's split.
-	// OpenAI prompt_tokens includes them, with the read portion in cached_tokens.
-	prompt += cacheRead + cacheWrite
+	// AI SDK totalUsage.inputTokens is inputTokens.total: noCache + cacheRead + cacheWrite.
+	// Command Code's cache share is cacheRead / inputTokens. Adding the cache
+	// buckets again inflates the denominator and cuts the reported rate.
+	// Only the older shape (inputTokens is the uncached remainder, so it is
+	// smaller than the cache buckets) needs those buckets folded in.
+	includesCache := commandCodeInputIncludesCache(prompt, cacheRead, cacheWrite)
+	if !includesCache {
+		prompt += cacheRead + cacheWrite
+	}
 	total := src.Get("totalTokens").Int()
-	if total == 0 || cacheRead > 0 || cacheWrite > 0 {
+	if total == 0 || !includesCache {
 		total = prompt + completion
 	}
 	usage := map[string]any{
@@ -442,11 +448,34 @@ func usageFromCommandCodeTotal(event gjson.Result) map[string]any {
 		"total_tokens":      total,
 	}
 	if cacheRead > 0 || cacheWrite > 0 {
-		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cacheRead}
+		details := map[string]any{}
+		if cacheRead > 0 {
+			details["cached_tokens"] = cacheRead
+		}
+		if cacheWrite > 0 {
+			// Nested so OpenAI usage accounting treats the write as a subset of prompt_tokens.
+			details["cache_write_tokens"] = cacheWrite
+		}
+		usage["prompt_tokens_details"] = details
 		usage["cache_read_input_tokens"] = cacheRead
 		usage["cache_creation_input_tokens"] = cacheWrite
 	}
 	return usage
+}
+
+// commandCodeInputIncludesCache reports whether inputTokens already contains
+// the cache read and write buckets. The AI SDK total does; a raw uncached count does not.
+func commandCodeInputIncludesCache(input, cacheRead, cacheWrite int64) bool {
+	if cacheRead < 0 {
+		cacheRead = 0
+	}
+	if cacheWrite < 0 {
+		cacheWrite = 0
+	}
+	if cacheRead > input {
+		return false
+	}
+	return input-cacheRead >= cacheWrite
 }
 
 type commandCodeOpenAIAccumulator struct {

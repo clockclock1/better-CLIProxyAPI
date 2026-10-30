@@ -116,14 +116,33 @@ func TestCommandCodeConversationUUIDStableAcrossTurns(t *testing.T) {
 }
 
 func TestUsageFromCommandCodeTotalIncludesCache(t *testing.T) {
+	// AI SDK inputTokens.total already includes cache read and write.
+	// Cache share is cacheRead / inputTokens = 100/130.
+	event := []byte(`{"type":"finish","totalUsage":{"inputTokens":130,"outputTokens":4,"totalTokens":134,"inputTokenDetails":{"cacheReadTokens":100,"cacheWriteTokens":20}}}`)
+	usage := usageFromCommandCodeTotal(gjson.ParseBytes(event))
+	if usage["prompt_tokens"] != int64(130) {
+		t.Fatalf("prompt_tokens = %#v, want 130", usage["prompt_tokens"])
+	}
+	if usage["total_tokens"] != int64(134) {
+		t.Fatalf("total_tokens = %#v, want 134", usage["total_tokens"])
+	}
+	details, _ := usage["prompt_tokens_details"].(map[string]any)
+	if details["cached_tokens"] != int64(100) {
+		t.Fatalf("cached_tokens = %#v", details["cached_tokens"])
+	}
+	if details["cache_write_tokens"] != int64(20) {
+		t.Fatalf("cache_write_tokens = %#v", details["cache_write_tokens"])
+	}
+}
+
+func TestUsageFromCommandCodeTotalFoldsExcludedCache(t *testing.T) {
 	event := []byte(`{"type":"finish","totalUsage":{"inputTokens":10,"outputTokens":4,"inputTokenDetails":{"cacheReadTokens":100,"cacheWriteTokens":20}}}`)
 	usage := usageFromCommandCodeTotal(gjson.ParseBytes(event))
 	if usage["prompt_tokens"] != int64(130) {
 		t.Fatalf("prompt_tokens = %#v, want 130", usage["prompt_tokens"])
 	}
-	details, _ := usage["prompt_tokens_details"].(map[string]any)
-	if details["cached_tokens"] != int64(100) {
-		t.Fatalf("cached_tokens = %#v", details["cached_tokens"])
+	if usage["total_tokens"] != int64(134) {
+		t.Fatalf("total_tokens = %#v, want 134", usage["total_tokens"])
 	}
 }
 
