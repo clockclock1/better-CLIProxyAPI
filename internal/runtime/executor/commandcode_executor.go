@@ -415,8 +415,68 @@ func streamCommandCodeCLI(
 
 	ticker := time.NewTicker(commandCodeStreamKeepAlive)
 	defer ticker.Stop()
-	toolIndex := 0
-	toolArgsStarted := map[int]bool{}
+	type toolStreamState struct {
+		index     int
+		id        string
+		arguments strings.Builder
+		announced bool
+		named     bool
+		completed bool
+	}
+	tools := map[string]*toolStreamState{}
+	toolOrder := []*toolStreamState{}
+	toolFor := func(event gjson.Result) (*toolStreamState, error) {
+		id := event.Get("toolCallId").String()
+		if id == "" {
+			id = event.Get("id").String()
+		}
+		if id == "" {
+			// Older gateways omit IDs on input deltas. Only infer an ID when
+			// exactly one unfinished call can own the event.
+			var pending *toolStreamState
+			for _, tool := range toolOrder {
+				if tool.completed {
+					continue
+				}
+				if pending != nil {
+					return nil, fmt.Errorf("commandcode: ambiguous tool input without a call ID")
+				}
+				pending = tool
+			}
+			if pending != nil {
+				return pending, nil
+			}
+			id = "call_" + uuid.NewString()[:12]
+		}
+		if tool := tools[id]; tool != nil {
+			return tool, nil
+		}
+		tool := &toolStreamState{index: len(toolOrder), id: id}
+		tools[id] = tool
+		toolOrder = append(toolOrder, tool)
+		return tool, nil
+	}
+	emitTool := func(tool *toolStreamState, name, arguments string) bool {
+		function := map[string]any{"arguments": arguments}
+		call := map[string]any{"index": tool.index, "function": function}
+		if !tool.announced {
+			call["id"] = tool.id
+			call["type"] = "function"
+			tool.announced = true
+		}
+		if name != "" && !tool.named {
+			function["name"] = name
+			tool.named = true
+		}
+		tool.arguments.WriteString(arguments)
+		return emit(acc.streamChunk(map[string]any{"tool_calls": []any{call}}, nil))
+	}
+	failTool := func(err error) {
+		select {
+		case out <- cliproxyexecutor.StreamChunk{Err: statusErr{code: http.StatusBadGateway, msg: err.Error()}}:
+		case <-ctx.Done():
+		}
+	}
 
 	for {
 		select {
@@ -429,6 +489,12 @@ func streamCommandCodeCLI(
 			}
 		case lr, ok := <-lines:
 			if !ok {
+				for _, tool := range toolOrder {
+					if !tool.completed {
+						failTool(fmt.Errorf("commandcode: incomplete tool call %q", tool.id))
+						return
+					}
+				}
 				final := acc.streamChunkWithUsage(map[string]any{}, acc.FinishReason, acc.Usage)
 				reporter.Publish(ctx, helps.ParseOpenAIUsage(final))
 				if !emit(final) {
@@ -480,26 +546,15 @@ func streamCommandCodeCLI(
 					return
 				}
 			case "tool-input-start":
-				toolName := gjson.GetBytes(event, "toolName").String()
-				callID := gjson.GetBytes(event, "toolCallId").String()
-				if callID == "" {
-					callID = "call_" + uuid.NewString()[:12]
+				tool, errTool := toolFor(gjson.ParseBytes(event))
+				if errTool != nil {
+					failTool(errTool)
+					return
 				}
-				delta := map[string]any{
-					"tool_calls": []any{
-						map[string]any{
-							"index": toolIndex,
-							"id":    callID,
-							"type":  "function",
-							"function": map[string]any{
-								"name":      toolName,
-								"arguments": "",
-							},
-						},
-					},
+				if tool.completed || tool.announced {
+					continue
 				}
-				toolArgsStarted[toolIndex] = true
-				if !emit(acc.streamChunk(delta, nil)) {
+				if !emitTool(tool, gjson.GetBytes(event, "toolName").String(), "") {
 					return
 				}
 			case "tool-input-delta":
@@ -510,24 +565,26 @@ func streamCommandCodeCLI(
 				if deltaText == "" {
 					continue
 				}
-				idx := toolIndex
-				if !toolArgsStarted[idx] {
-					toolArgsStarted[idx] = true
+				tool, errTool := toolFor(gjson.ParseBytes(event))
+				if errTool != nil {
+					failTool(errTool)
+					return
 				}
-				delta := map[string]any{
-					"tool_calls": []any{
-						map[string]any{
-							"index": idx,
-							"function": map[string]any{
-								"arguments": deltaText,
-							},
-						},
-					},
+				if tool.completed {
+					continue
 				}
-				if !emit(acc.streamChunk(delta, nil)) {
+				if !emitTool(tool, gjson.GetBytes(event, "toolName").String(), deltaText) {
 					return
 				}
 			case "tool-call":
+				tool, errTool := toolFor(gjson.ParseBytes(event))
+				if errTool != nil {
+					failTool(errTool)
+					return
+				}
+				if tool.completed {
+					continue
+				}
 				before := len(acc.ToolCalls)
 				_ = acc.ingest(event)
 				if len(acc.ToolCalls) <= before {
@@ -536,27 +593,21 @@ func streamCommandCodeCLI(
 				call := acc.ToolCalls[len(acc.ToolCalls)-1]
 				fn, _ := call["function"].(map[string]any)
 				args, _ := fn["arguments"].(string)
-				if toolArgsStarted[toolIndex] {
-					// Arguments were already streamed via tool-input-delta; only
-					// emit id/name if start was missed.
-					toolIndex++
-					continue
+				sent := tool.arguments.String()
+				if sent != "" {
+					if json.Valid([]byte(sent)) {
+						// Completed snapshots may serialize keys/whitespace differently.
+						args = ""
+					} else if strings.HasPrefix(args, sent) {
+						args = args[len(sent):]
+					} else {
+						failTool(fmt.Errorf("commandcode: inconsistent tool arguments for %q", tool.id))
+						return
+					}
 				}
-				delta := map[string]any{
-					"tool_calls": []any{
-						map[string]any{
-							"index": toolIndex,
-							"id":    call["id"],
-							"type":  "function",
-							"function": map[string]any{
-								"name":      fn["name"],
-								"arguments": args,
-							},
-						},
-					},
-				}
-				toolIndex++
-				if !emit(acc.streamChunk(delta, nil)) {
+				tool.completed = true
+				name, _ := fn["name"].(string)
+				if !emitTool(tool, name, args) {
 					return
 				}
 			case "finish", "finish-step":
