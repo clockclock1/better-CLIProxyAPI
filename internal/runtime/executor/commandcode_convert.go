@@ -71,7 +71,7 @@ func buildCommandCodeGenerateBody(model, threadID string, openaiPayload []byte) 
 	}
 
 	maxTokens := resolveCommandCodeMaxTokens(model, openaiPayload, false /* messagesRequires */)
-	effort := commandCodeReasoningEffort(openaiPayload)
+	effort := commandCodeReasoningEffort(model, openaiPayload)
 
 	var temperature *float64
 	if v := gjson.GetBytes(openaiPayload, "temperature"); v.Exists() && v.Type == gjson.Number {
@@ -124,7 +124,7 @@ func buildCommandCodeOpenAIBody(model string, openaiPayload []byte, stream bool)
 	commandCodeOffloadImagesInPlace(messages)
 	tools := openaiToolsToProviderOpenAI(openaiPayload)
 	maxTokens := resolveCommandCodeMaxTokens(model, openaiPayload, false)
-	effort := commandCodeReasoningEffort(openaiPayload)
+	effort := commandCodeReasoningEffort(model, openaiPayload)
 
 	body := map[string]any{
 		"model":    model,
@@ -175,10 +175,12 @@ func buildCommandCodeMessagesBody(model string, openaiPayload []byte, stream boo
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
-	effort := commandCodeReasoningEffort(openaiPayload)
+	effort := commandCodeReasoningEffort(model, openaiPayload)
 	if effort != "" && effort != "off" {
 		body["thinking"] = map[string]any{"type": "adaptive"}
 		body["output_config"] = map[string]any{"effort": effort}
+	} else if effort == "off" {
+		body["thinking"] = map[string]any{"type": "disabled"}
 	}
 	return json.Marshal(body)
 }
@@ -300,9 +302,34 @@ func commandCodeConversationUUID(openaiPayload []byte) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("commandcode-conversation\x00"+system+"\x00"+firstUser)).String()
 }
 
-func commandCodeReasoningEffort(openaiPayload []byte) string {
-	if v := strings.TrimSpace(gjson.GetBytes(openaiPayload, "reasoning_effort").String()); isCommandCodeEffort(v) {
-		return strings.ToLower(v)
+func commandCodeReasoningEffort(model string, openaiPayload []byte) string {
+	effort := strings.ToLower(strings.TrimSpace(gjson.GetBytes(openaiPayload, "reasoning_effort").String()))
+	deepseek := strings.HasPrefix(strings.ToLower(model), "deepseek/")
+	// DeepSeek's explicit mode toggle takes precedence over its effort field.
+	// Command Code's wire spelling for disabled thinking is "off".
+	if deepseek {
+		switch strings.ToLower(strings.TrimSpace(gjson.GetBytes(openaiPayload, "thinking.type").String())) {
+		case "disabled":
+			return "off"
+		case "enabled":
+			if effort == "none" || effort == "off" || effort == "" {
+				return "high"
+			}
+		}
+		switch effort {
+		case "minimal":
+			effort = "low"
+		case "medium", "xhigh":
+			effort = "high"
+		case "ultra":
+			effort = "max"
+		}
+	}
+	if effort == "none" {
+		effort = "off"
+	}
+	if isCommandCodeEffort(effort) {
+		return effort
 	}
 	return ""
 }
@@ -684,7 +711,7 @@ func openaiToolsToProviderOpenAI(payload []byte) []any {
 			"function": map[string]any{
 				"name":        fn.Get("name").String(),
 				"description": fn.Get("description").String(),
-				"parameters":   commandCodeToolParametersSchema(json.RawMessage(fn.Get("parameters").Raw)),
+				"parameters":  commandCodeToolParametersSchema(json.RawMessage(fn.Get("parameters").Raw)),
 			},
 		})
 		return true

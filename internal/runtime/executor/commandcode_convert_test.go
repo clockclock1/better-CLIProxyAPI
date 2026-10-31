@@ -346,3 +346,46 @@ func TestIsCommandCodeUpgradeRequired(t *testing.T) {
 		t.Fatal("500 without upgrade_required should be false")
 	}
 }
+
+func TestCommandCodeDeepSeekThinkingControls(t *testing.T) {
+	tests := []struct{ name, payload, want string }{
+		{"default", `{}`, ""},
+		{"low", `{"reasoning_effort":"low"}`, "low"},
+		{"disabled", `{"thinking":{"type":"disabled"}}`, "off"},
+		{"disabled_overrides_effort", `{"thinking":{"type":"disabled"},"reasoning_effort":"max"}`, "off"},
+		{"none", `{"reasoning_effort":"none"}`, "off"},
+		{"enabled_overrides_none", `{"thinking":{"type":"enabled"},"reasoning_effort":"none"}`, "high"},
+		{"enabled_low", `{"thinking":{"type":"enabled"},"reasoning_effort":"low"}`, "low"},
+		{"minimal", `{"reasoning_effort":"minimal"}`, "low"},
+		{"medium", `{"reasoning_effort":"medium"}`, "high"},
+		{"xhigh", `{"reasoning_effort":"xhigh"}`, "high"},
+		{"ultra", `{"reasoning_effort":"ultra"}`, "max"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, protocol := range []string{commandCodeProtocolCLI, commandCodeProtocolOpenAI} {
+				raw, err := buildCommandCodeBody(protocol, "deepseek/deepseek-v4.1-flash", "", []byte(tt.payload), true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := "reasoning_effort"
+				if protocol == commandCodeProtocolCLI {
+					path = "params." + path
+				}
+				if got := gjson.GetBytes(raw, path).String(); got != tt.want {
+					t.Errorf("%s effort = %q, want %q", protocol, got, tt.want)
+				}
+			}
+		})
+	}
+	raw, err := buildCommandCodeMessagesBody("claude-sonnet-5-5", []byte(`{"reasoning_effort":"off"}`), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gjson.GetBytes(raw, "thinking.type").String(); got != "disabled" {
+		t.Fatalf("messages thinking = %q, want disabled", got)
+	}
+	if got := commandCodeReasoningEffort("other/model", []byte(`{"reasoning_effort":"medium","thinking":{"type":"disabled"}}`)); got != "medium" {
+		t.Fatalf("non-DeepSeek effort changed: %q", got)
+	}
+}

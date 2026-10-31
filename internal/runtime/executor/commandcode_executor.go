@@ -120,7 +120,7 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	sessionID := commandCodeSessionID(ctx, opts, translated)
-	httpResp, protocol, errDo := e.doCommandCodeUpstream(ctx, auth, baseURL, apiKey, baseModel, sessionID, translated, false, reporter, false)
+	httpResp, protocol, errDo := e.doCommandCodeUpstream(ctx, auth, baseURL, apiKey, baseModel, sessionID, translated, false, reporter, false, req, opts)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
@@ -184,7 +184,7 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	}
 
 	sessionID := commandCodeSessionID(ctx, opts, translated)
-	httpResp, protocol, errDo := e.doCommandCodeUpstream(ctx, auth, baseURL, apiKey, baseModel, sessionID, translated, true, reporter, true)
+	httpResp, protocol, errDo := e.doCommandCodeUpstream(ctx, auth, baseURL, apiKey, baseModel, sessionID, translated, true, reporter, true, req, opts)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
@@ -253,6 +253,8 @@ func (e *CommandCodeExecutor) doCommandCodeUpstream(
 	stream bool,
 	reporter *helps.UsageReporter,
 	roundTripOnly bool,
+	req cliproxyexecutor.Request,
+	opts cliproxyexecutor.Options,
 ) (*http.Response, string, error) {
 	protocol := resolveCommandCodeProtocol(model, baseURL, apiKey)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -260,6 +262,15 @@ func (e *CommandCodeExecutor) doCommandCodeUpstream(
 		if errBody != nil {
 			return nil, protocol, statusErr{code: http.StatusBadRequest, msg: errBody.Error()}
 		}
+		root, format := "", sdktranslator.FormatOpenAI.String()
+		if protocol == commandCodeProtocolCLI {
+			root = "params"
+		} else if protocol == commandCodeProtocolMessages {
+			format = sdktranslator.FormatClaude.String()
+		}
+		// Apply user rules last on each freshly built transport, including fallback.
+		// Paths address business params regardless of the CLI framing envelope.
+		body = helps.NewPayloadFinalizer(e.cfg, e.Identifier(), model, format, root, body, req, opts)(body)
 		url := commandCodeProtocolEndpoint(baseURL, protocol)
 		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 		if errReq != nil {
