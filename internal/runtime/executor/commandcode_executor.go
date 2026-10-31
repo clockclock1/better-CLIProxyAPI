@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	commandcodeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/commandcode"
@@ -21,14 +23,17 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 var (
 	_ cliproxyauth.ProviderExecutor = (*CommandCodeExecutor)(nil)
 )
 
-// CommandCodeExecutor routes OpenAI-compatible chat requests through Command Code's
-// POST /alpha/generate NDJSON API (Go-plan free models and paid models).
+const commandCodeStreamKeepAlive = 15 * time.Second
+
+// CommandCodeExecutor routes OpenAI-compatible chat requests through Command Code
+// (/alpha/generate, /provider/v1/chat/completions, or /provider/v1/messages).
 type CommandCodeExecutor struct {
 	cfg *config.Config
 }
@@ -39,15 +44,12 @@ func NewCommandCodeExecutor(cfg *config.Config) *CommandCodeExecutor {
 	return &CommandCodeExecutor{cfg: cfg}
 }
 
-// Identifier returns the provider key.
 func (e *CommandCodeExecutor) Identifier() string { return "commandcode" }
 
-// RequestToFormat reports OpenAI chat as the upstream wire format after translation.
 func (e *CommandCodeExecutor) RequestToFormat(_ cliproxyexecutor.Request, _ cliproxyexecutor.Options) sdktranslator.Format {
 	return sdktranslator.FormatOpenAI
 }
 
-// PrepareRequest injects Command Code credentials and CLI headers.
 func (e *CommandCodeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
 		return nil
@@ -56,7 +58,7 @@ func (e *CommandCodeExecutor) PrepareRequest(req *http.Request, auth *cliproxyau
 	if strings.TrimSpace(apiKey) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
-	applyCommandCodeHeaders(req, auth, "")
+	applyCommandCodeHeaders(req, auth, "", "")
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -65,7 +67,6 @@ func (e *CommandCodeExecutor) PrepareRequest(req *http.Request, auth *cliproxyau
 	return nil
 }
 
-// HttpRequest injects credentials and executes the HTTP request.
 func (e *CommandCodeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
 		return nil, fmt.Errorf("commandcode executor: request is nil")
@@ -81,7 +82,6 @@ func (e *CommandCodeExecutor) HttpRequest(ctx context.Context, auth *cliproxyaut
 	return httpClient.Do(httpReq)
 }
 
-// Refresh is a no-op; Command Code API keys do not refresh via OAuth.
 func (e *CommandCodeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
 		return refreshed, err
@@ -89,12 +89,10 @@ func (e *CommandCodeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Au
 	return auth, nil
 }
 
-// CountTokens is not supported by /alpha/generate.
 func (e *CommandCodeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	return cliproxyexecutor.Response{}, statusErr{code: http.StatusNotImplemented, msg: "commandcode: count tokens not supported"}
 }
 
-// Execute aggregates /alpha/generate NDJSON into an OpenAI chat.completion response.
 func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	parsedThinking := thinking.ParseSuffix(req.Model)
@@ -112,10 +110,6 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FormatOpenAI
 
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 	if len(translated) == 0 {
 		translated = req.Payload
@@ -124,52 +118,9 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if isCommandCodeEffort(parsedThinking.RawSuffix) && strings.TrimSpace(gjson.GetBytes(translated, "reasoning_effort").String()) == "" {
 		translated = helps.SetStringIfDifferent(translated, "reasoning_effort", strings.ToLower(strings.TrimSpace(parsedThinking.RawSuffix)))
 	}
-	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayloadSource, false)
-	if len(originalTranslated) == 0 {
-		originalTranslated = originalPayloadSource
-	}
 
 	sessionID := commandCodeSessionID(ctx, opts, translated)
-	generateBody, errBody := buildCommandCodeGenerateBody(baseModel, sessionID, translated)
-	if errBody != nil {
-		err = statusErr{code: http.StatusBadRequest, msg: errBody.Error()}
-		return resp, err
-	}
-	url := strings.TrimSuffix(baseURL, "/") + "/alpha/generate"
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(generateBody))
-	if errReq != nil {
-		return resp, errReq
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	applyCommandCodeHeaders(httpReq, auth, sessionID)
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(httpReq, attrs, opts.Headers)
-
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      generateBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, errDo := doCommandCodeGenerateWithVersionRetry(ctx, httpClient, httpReq, auth, sessionID, generateBody)
+	httpResp, protocol, errDo := e.doCommandCodeUpstream(ctx, auth, baseURL, apiKey, baseModel, sessionID, translated, false, reporter, false)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return resp, errDo
@@ -184,32 +135,14 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		maybeLearnCommandCodeMaxTokens(baseModel, b)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
 
-	acc := newCommandCodeOpenAIAccumulator(baseModel)
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 52_428_800)
-	for scanner.Scan() {
-		event, ok := parseCommandCodeNDJSONLine(scanner.Bytes())
-		if !ok {
-			continue
-		}
-		helps.AppendAPIResponseChunk(ctx, e.cfg, event)
-		if errIngest := acc.ingest(event); errIngest != nil {
-			err = statusErr{code: http.StatusBadGateway, msg: errIngest.Error()}
-			return resp, err
-		}
-	}
-	if errScan := scanner.Err(); errScan != nil && ctx.Err() == nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-		return resp, errScan
-	}
-
-	openaiJSON, errJSON := acc.completionJSON()
-	if errJSON != nil {
-		err = errJSON
+	openaiJSON, errAgg := aggregateCommandCodeResponse(protocol, baseModel, httpResp.Body)
+	if errAgg != nil {
+		err = errAgg
 		return resp, err
 	}
 	reporter.ObserveResponseModel(openaiJSON)
@@ -224,7 +157,6 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	return resp, nil
 }
 
-// ExecuteStream streams /alpha/generate NDJSON as OpenAI chat.completion.chunk frames.
 func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
 	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	parsedThinking := thinking.ParseSuffix(req.Model)
@@ -242,10 +174,6 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	responseFormat := cliproxyexecutor.ResponseFormatOrSource(opts)
 	to := sdktranslator.FormatOpenAI
 
-	originalPayloadSource := req.Payload
-	if len(opts.OriginalRequest) > 0 {
-		originalPayloadSource = opts.OriginalRequest
-	}
 	translated := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 	if len(translated) == 0 {
 		translated = req.Payload
@@ -254,50 +182,9 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if isCommandCodeEffort(parsedThinking.RawSuffix) && strings.TrimSpace(gjson.GetBytes(translated, "reasoning_effort").String()) == "" {
 		translated = helps.SetStringIfDifferent(translated, "reasoning_effort", strings.ToLower(strings.TrimSpace(parsedThinking.RawSuffix)))
 	}
-	_ = originalPayloadSource
 
 	sessionID := commandCodeSessionID(ctx, opts, translated)
-	generateBody, errBody := buildCommandCodeGenerateBody(baseModel, sessionID, translated)
-	if errBody != nil {
-		err = statusErr{code: http.StatusBadRequest, msg: errBody.Error()}
-		return nil, err
-	}
-	url := strings.TrimSuffix(baseURL, "/") + "/alpha/generate"
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(generateBody))
-	if errReq != nil {
-		return nil, errReq
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	httpReq.Header.Set("Accept", "application/x-ndjson, text/event-stream, application/json")
-	applyCommandCodeHeaders(httpReq, auth, sessionID)
-	var attrs map[string]string
-	if auth != nil {
-		attrs = auth.Attributes
-	}
-	util.ApplyCustomHeadersFromAttrs(httpReq, attrs, opts.Headers)
-
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      generateBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
-	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
-	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
-	httpResp, errDo := doCommandCodeGenerateWithVersionRetry(ctx, httpClient, httpReq, auth, sessionID, generateBody)
+	httpResp, protocol, errDo := e.doCommandCodeUpstream(ctx, auth, baseURL, apiKey, baseModel, sessionID, translated, true, reporter, true)
 	if errDo != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
 		return nil, errDo
@@ -307,6 +194,7 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		b, _ := io.ReadAll(httpResp.Body)
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		_ = httpResp.Body.Close()
+		maybeLearnCommandCodeMaxTokens(baseModel, b)
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
@@ -319,10 +207,8 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				log.Errorf("commandcode executor: close response body error: %v", errClose)
 			}
 		}()
-
-		acc := newCommandCodeOpenAIAccumulator(baseModel)
 		var param any
-		emit := func(openaiChunk []byte) bool {
+		emitOpenAI := func(openaiChunk []byte) bool {
 			streamLine := append([]byte("data: "), openaiChunk...)
 			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, streamLine, &param)
 			for i := range chunks {
@@ -334,20 +220,237 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			}
 			return true
 		}
-
-		if !emit(acc.streamChunk(map[string]any{"role": "assistant", "content": ""}, nil)) {
-			return
+		emitDone := func() {
+			doneLine := []byte("data: [DONE]")
+			chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, doneLine, &param)
+			for i := range chunks {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
 
-		scanner := bufio.NewScanner(httpResp.Body)
+		switch protocol {
+		case commandCodeProtocolOpenAI:
+			streamCommandCodeOpenAI(ctx, httpResp.Body, emitOpenAI, emitDone, reporter, out)
+		case commandCodeProtocolMessages:
+			streamCommandCodeMessages(ctx, baseModel, httpResp.Body, emitOpenAI, emitDone, reporter, out)
+		default:
+			streamCommandCodeCLI(ctx, baseModel, httpResp.Body, emitOpenAI, emitDone, reporter, out)
+		}
+	}()
+
+	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+func (e *CommandCodeExecutor) doCommandCodeUpstream(
+	ctx context.Context,
+	auth *cliproxyauth.Auth,
+	baseURL, apiKey, model, sessionID string,
+	openaiPayload []byte,
+	stream bool,
+	reporter *helps.UsageReporter,
+	roundTripOnly bool,
+) (*http.Response, string, error) {
+	protocol := resolveCommandCodeProtocol(model, baseURL, apiKey)
+	for attempt := 0; attempt < 2; attempt++ {
+		body, errBody := buildCommandCodeBody(protocol, model, sessionID, openaiPayload, stream)
+		if errBody != nil {
+			return nil, protocol, statusErr{code: http.StatusBadRequest, msg: errBody.Error()}
+		}
+		url := commandCodeProtocolEndpoint(baseURL, protocol)
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if errReq != nil {
+			return nil, protocol, errReq
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream, application/x-ndjson, application/json")
+		}
+		applyCommandCodeHeaders(httpReq, auth, sessionID, protocol)
+		var attrs map[string]string
+		if auth != nil {
+			attrs = auth.Attributes
+		}
+		util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
+
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      body,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
+		if roundTripOnly {
+			httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
+		} else {
+			httpClient = reporter.TrackHTTPClient(httpClient)
+		}
+		httpResp, errDo := doCommandCodeWithVersionRetry(ctx, httpClient, httpReq, auth, sessionID, protocol, body)
+		if errDo != nil {
+			return nil, protocol, errDo
+		}
+		if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+			if protocol == commandCodeProtocolOpenAI || protocol == commandCodeProtocolCLI {
+				rememberCommandCodeProtocol(baseURL, apiKey, protocol)
+			}
+			return httpResp, protocol, nil
+		}
+		errBodyBytes, _ := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		helps.AppendAPIResponseChunk(ctx, e.cfg, errBodyBytes)
+		maybeLearnCommandCodeMaxTokens(model, errBodyBytes)
+
+		fallback := commandCodeProtocolFallback(protocol)
+		if attempt == 0 && fallback != "" && isCommandCodeUpgradeRequired(httpResp.StatusCode, errBodyBytes) {
+			helps.LogWithRequestID(ctx).Infof("commandcode: %s rejected (%d); falling back to %s", protocol, httpResp.StatusCode, fallback)
+			rememberCommandCodeProtocol(baseURL, apiKey, fallback)
+			protocol = fallback
+			continue
+		}
+		httpResp.Body = io.NopCloser(bytes.NewReader(errBodyBytes))
+		return httpResp, protocol, nil
+	}
+	return nil, protocol, statusErr{code: http.StatusBadGateway, msg: "commandcode: exhausted protocol attempts"}
+}
+
+func buildCommandCodeBody(protocol, model, sessionID string, openaiPayload []byte, stream bool) ([]byte, error) {
+	switch protocol {
+	case commandCodeProtocolOpenAI:
+		return buildCommandCodeOpenAIBody(model, openaiPayload, stream)
+	case commandCodeProtocolMessages:
+		return buildCommandCodeMessagesBody(model, openaiPayload, stream)
+	default:
+		return buildCommandCodeGenerateBody(model, sessionID, openaiPayload)
+	}
+}
+
+func aggregateCommandCodeResponse(protocol, model string, body io.Reader) ([]byte, error) {
+	switch protocol {
+	case commandCodeProtocolOpenAI:
+		b, err := io.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	case commandCodeProtocolMessages:
+		b, err := io.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+		return messagesResponseToOpenAI(model, b)
+	default:
+		acc := newCommandCodeOpenAIAccumulator(model)
+		scanner := bufio.NewScanner(body)
 		scanner.Buffer(nil, 52_428_800)
-		toolIndex := 0
 		for scanner.Scan() {
 			event, ok := parseCommandCodeNDJSONLine(scanner.Bytes())
 			if !ok {
 				continue
 			}
-			helps.AppendAPIResponseChunk(ctx, e.cfg, event)
+			if errIngest := acc.ingest(event); errIngest != nil {
+				return nil, statusErr{code: http.StatusBadGateway, msg: errIngest.Error()}
+			}
+		}
+		if errScan := scanner.Err(); errScan != nil {
+			return nil, errScan
+		}
+		return acc.completionJSON()
+	}
+}
+
+func streamCommandCodeCLI(
+	ctx context.Context,
+	model string,
+	body io.Reader,
+	emit func([]byte) bool,
+	emitDone func(),
+	reporter *helps.UsageReporter,
+	out chan<- cliproxyexecutor.StreamChunk,
+) {
+	acc := newCommandCodeOpenAIAccumulator(model)
+	if !emit(acc.streamChunk(map[string]any{"role": "assistant", "content": ""}, nil)) {
+		return
+	}
+
+	type lineResult struct {
+		line []byte
+		err  error
+	}
+	lines := make(chan lineResult, 8)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(nil, 52_428_800)
+		for scanner.Scan() {
+			dup := append([]byte(nil), scanner.Bytes()...)
+			select {
+			case lines <- lineResult{line: dup}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if errScan := scanner.Err(); errScan != nil {
+			select {
+			case lines <- lineResult{err: errScan}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(commandCodeStreamKeepAlive)
+	defer ticker.Stop()
+	toolIndex := 0
+	toolArgsStarted := map[int]bool{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Keep client-side stream-idle timers alive during long tool-arg generation.
+			if !emit(acc.streamChunk(map[string]any{"content": ""}, nil)) {
+				return
+			}
+		case lr, ok := <-lines:
+			if !ok {
+				final := acc.streamChunkWithUsage(map[string]any{}, acc.FinishReason, acc.Usage)
+				reporter.Publish(ctx, helps.ParseOpenAIUsage(final))
+				if !emit(final) {
+					return
+				}
+				emitDone()
+				return
+			}
+			if lr.err != nil {
+				helps.RecordAPIResponseError(ctx, nil, lr.err)
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: lr.err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			ticker.Reset(commandCodeStreamKeepAlive)
+			event, okEvent := parseCommandCodeNDJSONLine(lr.line)
+			if !okEvent {
+				continue
+			}
+			helps.AppendAPIResponseChunk(ctx, nil, event)
 			typ := gjson.GetBytes(event, "type").String()
 			switch typ {
 			case "error":
@@ -367,13 +470,61 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				if !emit(acc.streamChunk(map[string]any{"content": text}, nil)) {
 					return
 				}
-			case "reasoning-delta":
+			case "reasoning-delta", "reasoning-start":
 				text := gjson.GetBytes(event, "text").String()
 				_ = acc.ingest(event)
 				if text == "" {
 					continue
 				}
 				if !emit(acc.streamChunk(map[string]any{"reasoning_content": text}, nil)) {
+					return
+				}
+			case "tool-input-start":
+				toolName := gjson.GetBytes(event, "toolName").String()
+				callID := gjson.GetBytes(event, "toolCallId").String()
+				if callID == "" {
+					callID = "call_" + uuid.NewString()[:12]
+				}
+				delta := map[string]any{
+					"tool_calls": []any{
+						map[string]any{
+							"index": toolIndex,
+							"id":    callID,
+							"type":  "function",
+							"function": map[string]any{
+								"name":      toolName,
+								"arguments": "",
+							},
+						},
+					},
+				}
+				toolArgsStarted[toolIndex] = true
+				if !emit(acc.streamChunk(delta, nil)) {
+					return
+				}
+			case "tool-input-delta":
+				deltaText := gjson.GetBytes(event, "delta").String()
+				if deltaText == "" {
+					deltaText = gjson.GetBytes(event, "inputTextDelta").String()
+				}
+				if deltaText == "" {
+					continue
+				}
+				idx := toolIndex
+				if !toolArgsStarted[idx] {
+					toolArgsStarted[idx] = true
+				}
+				delta := map[string]any{
+					"tool_calls": []any{
+						map[string]any{
+							"index": idx,
+							"function": map[string]any{
+								"arguments": deltaText,
+							},
+						},
+					},
+				}
+				if !emit(acc.streamChunk(delta, nil)) {
 					return
 				}
 			case "tool-call":
@@ -384,6 +535,13 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				}
 				call := acc.ToolCalls[len(acc.ToolCalls)-1]
 				fn, _ := call["function"].(map[string]any)
+				args, _ := fn["arguments"].(string)
+				if toolArgsStarted[toolIndex] {
+					// Arguments were already streamed via tool-input-delta; only
+					// emit id/name if start was missed.
+					toolIndex++
+					continue
+				}
 				delta := map[string]any{
 					"tool_calls": []any{
 						map[string]any{
@@ -392,7 +550,7 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 							"type":  "function",
 							"function": map[string]any{
 								"name":      fn["name"],
-								"arguments": fn["arguments"],
+								"arguments": args,
 							},
 						},
 					},
@@ -407,32 +565,397 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				_ = acc.ingest(event)
 			}
 		}
-		if errScan := scanner.Err(); errScan != nil && ctx.Err() == nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
-			case <-ctx.Done():
-			}
-			return
-		}
+	}
+}
 
-		final := acc.streamChunkWithUsage(map[string]any{}, acc.FinishReason, acc.Usage)
-		reporter.Publish(ctx, helps.ParseOpenAIUsage(final))
-		if !emit(final) {
-			return
-		}
-		doneLine := []byte("data: [DONE]")
-		chunks := sdktranslator.TranslateStream(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, doneLine, &param)
-		for i := range chunks {
+func streamCommandCodeOpenAI(
+	ctx context.Context,
+	body io.Reader,
+	emit func([]byte) bool,
+	emitDone func(),
+	reporter *helps.UsageReporter,
+	out chan<- cliproxyexecutor.StreamChunk,
+) {
+	type lineResult struct {
+		line []byte
+		err  error
+	}
+	lines := make(chan lineResult, 8)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(nil, 52_428_800)
+		for scanner.Scan() {
+			dup := append([]byte(nil), scanner.Bytes()...)
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+			case lines <- lineResult{line: dup}:
 			case <-ctx.Done():
 				return
 			}
 		}
+		if errScan := scanner.Err(); errScan != nil {
+			select {
+			case lines <- lineResult{err: errScan}:
+			case <-ctx.Done():
+			}
+		}
 	}()
 
-	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+	ticker := time.NewTicker(commandCodeStreamKeepAlive)
+	defer ticker.Stop()
+	sawDone := false
+	var lastUsage []byte
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			keepalive := []byte(`{"id":"chatcmpl-keepalive","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}`)
+			if !emit(keepalive) {
+				return
+			}
+		case lr, ok := <-lines:
+			if !ok {
+				if lastUsage != nil {
+					reporter.Publish(ctx, helps.ParseOpenAIUsage(lastUsage))
+					_ = emit(lastUsage)
+				}
+				if !sawDone {
+					emitDone()
+				}
+				return
+			}
+			if lr.err != nil {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: lr.err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			ticker.Reset(commandCodeStreamKeepAlive)
+			trimmed := bytes.TrimSpace(lr.line)
+			if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte(":")) {
+				continue
+			}
+			payload := trimmed
+			if bytes.HasPrefix(payload, []byte("data:")) {
+				payload = bytes.TrimSpace(bytes.TrimPrefix(payload, []byte("data:")))
+			}
+			if bytes.Equal(payload, []byte("[DONE]")) {
+				sawDone = true
+				emitDone()
+				return
+			}
+			if !json.Valid(payload) {
+				continue
+			}
+			normalized := normalizeOpenAIReasoningDelta(payload)
+			if gjson.GetBytes(normalized, "usage").Exists() {
+				lastUsage = normalized
+				reporter.Publish(ctx, helps.ParseOpenAIUsage(normalized))
+			}
+			if !emit(normalized) {
+				return
+			}
+		}
+	}
+}
+
+func normalizeOpenAIReasoningDelta(chunk []byte) []byte {
+	// Gateway families spell thinking as reasoning / reasoning_content / reasoning_details.
+	delta := gjson.GetBytes(chunk, "choices.0.delta")
+	if !delta.Exists() {
+		return chunk
+	}
+	if delta.Get("reasoning_content").Exists() {
+		return chunk
+	}
+	text := delta.Get("reasoning").String()
+	if text == "" {
+		details := delta.Get("reasoning_details")
+		if details.IsArray() {
+			var parts []string
+			details.ForEach(func(_, d gjson.Result) bool {
+				t := d.Get("text").String()
+				if t == "" {
+					t = d.Get("summary").String()
+				}
+				if t != "" {
+					parts = append(parts, t)
+				}
+				return true
+			})
+			text = strings.Join(parts, "")
+		}
+	}
+	if text == "" {
+		return chunk
+	}
+	out, err := sjson.SetBytes(chunk, "choices.0.delta.reasoning_content", text)
+	if err != nil {
+		return chunk
+	}
+	return out
+}
+
+func streamCommandCodeMessages(
+	ctx context.Context,
+	model string,
+	body io.Reader,
+	emit func([]byte) bool,
+	emitDone func(),
+	reporter *helps.UsageReporter,
+	out chan<- cliproxyexecutor.StreamChunk,
+) {
+	acc := newCommandCodeOpenAIAccumulator(model)
+	if !emit(acc.streamChunk(map[string]any{"role": "assistant", "content": ""}, nil)) {
+		return
+	}
+
+	type lineResult struct {
+		line []byte
+		err  error
+	}
+	lines := make(chan lineResult, 8)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(body)
+		scanner.Buffer(nil, 52_428_800)
+		for scanner.Scan() {
+			dup := append([]byte(nil), scanner.Bytes()...)
+			select {
+			case lines <- lineResult{line: dup}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if errScan := scanner.Err(); errScan != nil {
+			select {
+			case lines <- lineResult{err: errScan}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(commandCodeStreamKeepAlive)
+	defer ticker.Stop()
+	toolIndex := -1
+	blockType := ""
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !emit(acc.streamChunk(map[string]any{"content": ""}, nil)) {
+				return
+			}
+		case lr, ok := <-lines:
+			if !ok {
+				final := acc.streamChunkWithUsage(map[string]any{}, acc.FinishReason, acc.Usage)
+				reporter.Publish(ctx, helps.ParseOpenAIUsage(final))
+				_ = emit(final)
+				emitDone()
+				return
+			}
+			if lr.err != nil {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: lr.err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			ticker.Reset(commandCodeStreamKeepAlive)
+			trimmed := bytes.TrimSpace(lr.line)
+			if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte(":")) || bytes.HasPrefix(trimmed, []byte("event:")) {
+				continue
+			}
+			payload := trimmed
+			if bytes.HasPrefix(payload, []byte("data:")) {
+				payload = bytes.TrimSpace(bytes.TrimPrefix(payload, []byte("data:")))
+			}
+			if !json.Valid(payload) {
+				continue
+			}
+			evType := gjson.GetBytes(payload, "type").String()
+			switch evType {
+			case "ping":
+				if !emit(acc.streamChunk(map[string]any{"content": ""}, nil)) {
+					return
+				}
+			case "content_block_start":
+				blockType = gjson.GetBytes(payload, "content_block.type").String()
+				if blockType == "tool_use" {
+					toolIndex++
+					delta := map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": toolIndex,
+								"id":    gjson.GetBytes(payload, "content_block.id").String(),
+								"type":  "function",
+								"function": map[string]any{
+									"name":      gjson.GetBytes(payload, "content_block.name").String(),
+									"arguments": "",
+								},
+							},
+						},
+					}
+					acc.FinishReason = "tool_calls"
+					if !emit(acc.streamChunk(delta, nil)) {
+						return
+					}
+				}
+			case "content_block_delta":
+				dType := gjson.GetBytes(payload, "delta.type").String()
+				switch dType {
+				case "text_delta":
+					text := gjson.GetBytes(payload, "delta.text").String()
+					acc.Content.WriteString(text)
+					if text != "" && !emit(acc.streamChunk(map[string]any{"content": text}, nil)) {
+						return
+					}
+				case "thinking_delta":
+					text := gjson.GetBytes(payload, "delta.thinking").String()
+					acc.Reasoning.WriteString(text)
+					if text != "" && !emit(acc.streamChunk(map[string]any{"reasoning_content": text}, nil)) {
+						return
+					}
+				case "input_json_delta":
+					partial := gjson.GetBytes(payload, "delta.partial_json").String()
+					if partial == "" || toolIndex < 0 {
+						continue
+					}
+					delta := map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": toolIndex,
+								"function": map[string]any{
+									"arguments": partial,
+								},
+							},
+						},
+					}
+					if !emit(acc.streamChunk(delta, nil)) {
+						return
+					}
+				}
+			case "message_delta":
+				if stop := gjson.GetBytes(payload, "delta.stop_reason").String(); stop != "" {
+					acc.FinishReason = mapMessagesStopReason(stop)
+				}
+				if u := usageFromMessagesEvent(gjson.ParseBytes(payload)); u != nil {
+					acc.Usage = u
+				}
+			case "message_stop":
+				final := acc.streamChunkWithUsage(map[string]any{}, acc.FinishReason, acc.Usage)
+				reporter.Publish(ctx, helps.ParseOpenAIUsage(final))
+				_ = emit(final)
+				emitDone()
+				return
+			}
+		}
+	}
+}
+
+func mapMessagesStopReason(stop string) string {
+	switch stop {
+	case "tool_use":
+		return "tool_calls"
+	case "max_tokens":
+		return "length"
+	default:
+		return "stop"
+	}
+}
+
+func usageFromMessagesEvent(event gjson.Result) map[string]any {
+	src := event.Get("usage")
+	if !src.Exists() {
+		return nil
+	}
+	prompt := src.Get("input_tokens").Int()
+	completion := src.Get("output_tokens").Int()
+	cacheRead := src.Get("cache_read_input_tokens").Int()
+	cacheWrite := src.Get("cache_creation_input_tokens").Int()
+	usage := map[string]any{
+		"prompt_tokens":     prompt + cacheRead + cacheWrite,
+		"completion_tokens": completion,
+		"total_tokens":      prompt + cacheRead + cacheWrite + completion,
+	}
+	if cacheRead > 0 || cacheWrite > 0 {
+		details := map[string]any{}
+		if cacheRead > 0 {
+			details["cached_tokens"] = cacheRead
+		}
+		if cacheWrite > 0 {
+			details["cache_write_tokens"] = cacheWrite
+		}
+		usage["prompt_tokens_details"] = details
+	}
+	return usage
+}
+
+func messagesResponseToOpenAI(model string, raw []byte) ([]byte, error) {
+	acc := newCommandCodeOpenAIAccumulator(model)
+	content := gjson.GetBytes(raw, "content")
+	if content.IsArray() {
+		content.ForEach(func(_, block gjson.Result) bool {
+			switch block.Get("type").String() {
+			case "text":
+				acc.Content.WriteString(block.Get("text").String())
+			case "thinking":
+				acc.Reasoning.WriteString(block.Get("thinking").String())
+			case "tool_use":
+				args := block.Get("input").Raw
+				if args == "" {
+					args = "{}"
+				}
+				acc.ToolCalls = append(acc.ToolCalls, map[string]any{
+					"id":   block.Get("id").String(),
+					"type": "function",
+					"function": map[string]any{
+						"name":      block.Get("name").String(),
+						"arguments": args,
+					},
+				})
+				acc.FinishReason = "tool_calls"
+			}
+			return true
+		})
+	}
+	if stop := gjson.GetBytes(raw, "stop_reason").String(); stop != "" && acc.FinishReason == "stop" {
+		acc.FinishReason = mapMessagesStopReason(stop)
+	}
+	if u := usageFromMessagesEvent(gjson.ParseBytes(raw)); u != nil {
+		acc.Usage = u
+	}
+	return acc.completionJSON()
+}
+
+func maybeLearnCommandCodeMaxTokens(model string, errBody []byte) {
+	// e.g. max_tokens: 200000 > 128000
+	msg := string(errBody)
+	idx := strings.Index(strings.ToLower(msg), "max_tokens:")
+	if idx < 0 {
+		return
+	}
+	fragment := msg[idx:]
+	gt := strings.Index(fragment, ">")
+	if gt < 0 {
+		return
+	}
+	rest := strings.TrimSpace(fragment[gt+1:])
+	var ceiling int
+	for i, r := range rest {
+		if r < '0' || r > '9' {
+			rest = rest[:i]
+			break
+		}
+	}
+	if _, err := fmt.Sscanf(rest, "%d", &ceiling); err == nil && ceiling > 0 {
+		noteCommandCodeLearnedMaxTokens(model, ceiling)
+	}
 }
 
 func commandCodeCreds(a *cliproxyauth.Auth) (baseURL, apiKey string) {
@@ -466,9 +989,7 @@ func commandCodeCreds(a *cliproxyauth.Auth) (baseURL, apiKey string) {
 	return strings.TrimRight(baseURL, "/"), apiKey
 }
 
-// doCommandCodeGenerateWithVersionRetry sends /alpha/generate and, on
-// upgrade_required, bumps the cached CLI version then retries once.
-func doCommandCodeGenerateWithVersionRetry(ctx context.Context, client *http.Client, req *http.Request, auth *cliproxyauth.Auth, sessionID string, body []byte) (*http.Response, error) {
+func doCommandCodeWithVersionRetry(ctx context.Context, client *http.Client, req *http.Request, auth *cliproxyauth.Auth, sessionID, protocol string, body []byte) (*http.Response, error) {
 	httpResp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, errDo
@@ -490,7 +1011,7 @@ func doCommandCodeGenerateWithVersionRetry(ctx context.Context, client *http.Cli
 		return httpResp, nil
 	}
 	retryReq.Header = req.Header.Clone()
-	applyCommandCodeHeaders(retryReq, auth, sessionID)
+	applyCommandCodeHeaders(retryReq, auth, sessionID, protocol)
 	retryResp, errRetry := client.Do(retryReq)
 	if errRetry != nil {
 		httpResp.Body = io.NopCloser(bytes.NewReader(errBody))
@@ -499,7 +1020,7 @@ func doCommandCodeGenerateWithVersionRetry(ctx context.Context, client *http.Cli
 	return retryResp, nil
 }
 
-func applyCommandCodeHeaders(req *http.Request, auth *cliproxyauth.Auth, sessionID string) {
+func applyCommandCodeHeaders(req *http.Request, auth *cliproxyauth.Auth, sessionID, protocol string) {
 	if req == nil {
 		return
 	}
@@ -511,17 +1032,16 @@ func applyCommandCodeHeaders(req *http.Request, auth *cliproxyauth.Auth, session
 	req.Header.Set("User-Agent", "cli")
 	req.Header.Set("x-command-code-version", version)
 	req.Header.Set("x-cli-environment", "production")
-	// Neutral slug — avoid pulling proxy-repo-specific server prompt/taste context.
 	req.Header.Set("x-project-slug", "proxy")
 	req.Header.Set("x-taste-learning", "false")
 	if sessionID != "" {
 		req.Header.Set("x-session-id", sessionID)
 	}
+	if protocol == commandCodeProtocolMessages {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
 }
 
-// commandCodeSessionID is the stable prompt-cache scope. Codex pins this with
-// prompt_cache_key; Command Code pins it with threadId / x-session-id. A new
-// UUID per request makes the server miss the cache every turn.
 func commandCodeSessionID(ctx context.Context, opts cliproxyexecutor.Options, payload []byte) string {
 	if id := strings.TrimSpace(util.SessionIDFromContext(ctx)); id != "" {
 		return commandCodeThreadUUID(id)

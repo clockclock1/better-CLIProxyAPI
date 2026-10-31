@@ -18,10 +18,11 @@ var embeddedCommandCodeModelsJSON []byte
 var embeddedCommandCodeCapabilitiesJSON []byte
 
 type commandCodeModelsStore struct {
-	mu       sync.RWMutex
-	models   []*ModelInfo
-	rawJSON  []byte
-	revision uint64
+	mu        sync.RWMutex
+	models    []*ModelInfo
+	rawJSON   []byte
+	revision  uint64
+	endpoints map[string][]string // model id → supported_endpoints from /provider/v1/models
 }
 
 var commandCodeCatalogStore = &commandCodeModelsStore{}
@@ -63,6 +64,7 @@ func loadCommandCodeModelsFromBytes(data []byte, source string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("%s: %w", source, err)
 	}
+	endpoints := extractCommandCodeEndpoints(data, models)
 	clonedData := append([]byte(nil), data...)
 	commandCodeCatalogStore.mu.Lock()
 	if bytes.Equal(commandCodeCatalogStore.rawJSON, clonedData) {
@@ -71,9 +73,78 @@ func loadCommandCodeModelsFromBytes(data []byte, source string) (bool, error) {
 	}
 	commandCodeCatalogStore.models = models
 	commandCodeCatalogStore.rawJSON = clonedData
+	commandCodeCatalogStore.endpoints = endpoints
 	commandCodeCatalogStore.revision++
 	commandCodeCatalogStore.mu.Unlock()
 	return true, nil
+}
+
+func extractCommandCodeEndpoints(data []byte, models []*ModelInfo) map[string][]string {
+	out := make(map[string][]string)
+	var providerPayload commandCodeProviderModelsPayload
+	if err := json.Unmarshal(bytes.TrimSpace(data), &providerPayload); err == nil && len(providerPayload.Data) > 0 {
+		for _, raw := range providerPayload.Data {
+			id := strings.TrimSpace(raw.ID)
+			if id == "" || len(raw.SupportedEndpoints) == 0 {
+				continue
+			}
+			out[id] = append([]string(nil), raw.SupportedEndpoints...)
+		}
+	}
+	for _, m := range models {
+		if m == nil {
+			continue
+		}
+		id := strings.TrimSpace(m.ID)
+		if id == "" || len(m.SupportedEndpoints) == 0 {
+			continue
+		}
+		if _, ok := out[id]; !ok {
+			out[id] = append([]string(nil), m.SupportedEndpoints...)
+		}
+	}
+	return out
+}
+
+// CommandCodeSupportedEndpoints returns catalog-published routes for a model
+// (e.g. /messages, /chat/completions). Empty when unknown.
+func CommandCodeSupportedEndpoints(modelID string) []string {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil
+	}
+	commandCodeCatalogStore.mu.RLock()
+	defer commandCodeCatalogStore.mu.RUnlock()
+	eps := commandCodeCatalogStore.endpoints[modelID]
+	if len(eps) == 0 {
+		if idx := strings.LastIndex(modelID, "/"); idx >= 0 {
+			eps = commandCodeCatalogStore.endpoints[modelID[idx+1:]]
+		}
+	}
+	if len(eps) == 0 {
+		return nil
+	}
+	return append([]string(nil), eps...)
+}
+
+// CommandCodeRequiresMessages reports whether the model must use Anthropic
+// Messages (/provider/v1/messages). Catalog supported_endpoints wins; otherwise
+// the claude-* prefix rule matches the official CLI / Mars-Sea adapter.
+func CommandCodeRequiresMessages(modelID string) bool {
+	eps := CommandCodeSupportedEndpoints(modelID)
+	if len(eps) > 0 {
+		for _, e := range eps {
+			if e == "/messages" {
+				return true
+			}
+		}
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(modelID))
+	if idx := strings.LastIndex(lower, "/"); idx >= 0 {
+		lower = lower[idx+1:]
+	}
+	return strings.HasPrefix(lower, "claude-") || strings.HasPrefix(lower, "claude_")
 }
 
 type commandCodeProviderModelsPayload struct {
@@ -229,6 +300,7 @@ func commandCodeModelInfoFromProvider(raw commandCodeProviderModelRaw) *ModelInf
 		MaxCompletionTokens:        outTokens,
 		InputTokenLimit:            ctxLen,
 		OutputTokenLimit:           outTokens,
+		SupportedEndpoints:         append([]string(nil), raw.SupportedEndpoints...),
 		SupportedInputModalities:   commandCodeInputModalities(id),
 		SupportedOutputModalities:  []string{"text"},
 		SupportedGenerationMethods: []string{"generateContent"},

@@ -76,6 +76,9 @@ type ModelInfo struct {
 	MaxContextLength int `json:"-"`
 	// MaxCompletionTokens is the maximum completion tokens
 	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
+	// SupportedEndpoints lists Command Code Provider API routes for the model
+	// (e.g. /messages, /chat/completions). Internal routing only — not listed.
+	SupportedEndpoints []string `json:"-"`
 	// SupportedParameters lists supported parameters
 	SupportedParameters []string `json:"supported_parameters,omitempty"`
 	// SupportedInputModalities lists supported input modalities (e.g., TEXT, IMAGE, VIDEO, AUDIO)
@@ -854,6 +857,9 @@ func cloneModelInfo(model *ModelInfo) *ModelInfo {
 	}
 	if len(model.SupportedOutputModalities) > 0 {
 		copyModel.SupportedOutputModalities = append([]string(nil), model.SupportedOutputModalities...)
+	}
+	if len(model.SupportedEndpoints) > 0 {
+		copyModel.SupportedEndpoints = append([]string(nil), model.SupportedEndpoints...)
 	}
 	if model.Thinking != nil {
 		copyThinking := *model.Thinking

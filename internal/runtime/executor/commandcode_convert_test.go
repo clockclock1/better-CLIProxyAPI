@@ -35,13 +35,19 @@ func TestBuildCommandCodeGenerateBodyNeutralWorkspace(t *testing.T) {
 	if strings.Contains(string(raw), `"promptCache"`) {
 		t.Fatalf("promptCache must stay omitted, got %s", raw)
 	}
-	if body.Params.MaxTokens != 64000 {
-		t.Fatalf("max_tokens = %d, want catalog default 64000", body.Params.MaxTokens)
+	if body.Params.MaxTokens == nil || *body.Params.MaxTokens != 64000 {
+		t.Fatalf("max_tokens = %#v, want catalog default 64000", body.Params.MaxTokens)
 	}
 	if body.Config.WorkingDir != "/" {
 		t.Fatalf("workingDir = %q, want neutral /", body.Config.WorkingDir)
 	}
-	assertCachedSystem(t, body.Params.System, commandCodeNeutralSystem)
+	if sys, ok := body.Params.System.(string); !ok || sys != "" {
+		t.Fatalf("system = %#v, want empty string (no proxy injection)", body.Params.System)
+	}
+	if strings.Contains(string(raw), "Do not invent a working directory") ||
+		strings.Contains(string(raw), "Use only the tools provided in this request") {
+		t.Fatalf("proxy must not inject neutral system prompt, body=%s", raw)
+	}
 	if body.Config.IsGitRepo || len(body.Config.Structure) != 0 || body.Config.GitStatus != "" {
 		t.Fatalf("workspace prompt fields must stay empty: %+v", body.Config)
 	}
@@ -159,5 +165,159 @@ func assertCachedSystem(t *testing.T, system any, wantText string) {
 	cache, _ := section["cache_control"].(map[string]any)
 	if cache["type"] != "ephemeral" {
 		t.Fatalf("cache_control = %#v, want ephemeral", section["cache_control"])
+	}
+}
+
+func TestOpenAIMessagesToCommandCodeReplaysReasoning(t *testing.T) {
+	payload := []byte(`{
+		"messages":[{
+			"role":"assistant",
+			"content":"ok",
+			"reasoning_content":"think first",
+			"tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{\"path\":\"a\"}"}}]
+		}]
+	}`)
+	messages, _ := openaiMessagesToCommandCode(payload)
+	if len(messages) != 1 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	msg := messages[0].(map[string]any)
+	content := msg["content"].([]any)
+	if len(content) < 3 {
+		t.Fatalf("content = %#v, want reasoning+text+tool-call", content)
+	}
+	first := content[0].(map[string]any)
+	if first["type"] != "reasoning" || first["text"] != "think first" {
+		t.Fatalf("first block = %#v, want reasoning", first)
+	}
+}
+
+func TestOpenAIMessagesToProviderOpenAIReplaysReasoningContent(t *testing.T) {
+	payload := []byte(`{
+		"messages":[{
+			"role":"assistant",
+			"content":null,
+			"reasoning_content":"beam thinks",
+			"tool_calls":[{"id":"call_1","type":"function","function":{"name":"X","arguments":"{}"}}]
+		}]
+	}`)
+	messages := openaiMessagesToProviderOpenAI(payload)
+	if len(messages) != 1 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	msg := messages[0].(map[string]any)
+	if msg["reasoning_content"] != "beam thinks" {
+		t.Fatalf("reasoning_content = %#v", msg["reasoning_content"])
+	}
+	if msg["tool_calls"] == nil {
+		t.Fatal("expected tool_calls")
+	}
+}
+
+func TestCommandCodeToolSchemaNormalizeRoot(t *testing.T) {
+	schema := commandCodeToolParametersSchema(json.RawMessage(`{"properties":{"q":{"type":"string"}},"required":["q"]}`))
+	if schema["type"] != "object" {
+		t.Fatalf("type = %#v, want object", schema["type"])
+	}
+	refSchema := commandCodeToolParametersSchema(json.RawMessage(`{
+		"$defs":{"P":{"type":"object","properties":{"a":{"type":"string"}}}},
+		"$ref":"#/$defs/P"
+	}`))
+	if refSchema["type"] != "object" {
+		t.Fatalf("ref schema type = %#v", refSchema["type"])
+	}
+}
+
+func TestResolveCommandCodeMaxTokensOmit(t *testing.T) {
+	payload := []byte(`{"max_tokens":0}`)
+	if got := resolveCommandCodeMaxTokens("deepseek/deepseek-v4.1-flash", payload, false); got != nil {
+		t.Fatalf("omit path got %#v, want nil", got)
+	}
+	if got := resolveCommandCodeMaxTokens("claude-sonnet-5-5", payload, true); got == nil || *got <= 0 {
+		t.Fatalf("messages requires positive max_tokens, got %#v", got)
+	}
+}
+
+func TestResolveCommandCodeProtocolMessagesForClaude(t *testing.T) {
+	if got := resolveCommandCodeProtocol("claude-sonnet-5-5", "https://api.commandcode.ai", "key"); got != commandCodeProtocolMessages {
+		t.Fatalf("got %q, want messages", got)
+	}
+	t.Setenv("COMMANDCODE_PROTOCOL", "cli")
+	if got := resolveCommandCodeProtocol("deepseek/deepseek-v4.1-flash", "https://api.commandcode.ai", "key"); got != commandCodeProtocolCLI {
+		t.Fatalf("forced cli got %q", got)
+	}
+}
+
+func TestCommandCodeOffloadImagesBudget(t *testing.T) {
+	big := "data:image/png;base64," + strings.Repeat("A", commandCodeImageMaxBytes/2)
+	messages := []any{
+		map[string]any{
+			"role": "user",
+			"content": []any{
+				commandCodeCLIImageShape(big),
+				commandCodeCLIImageShape(big),
+				commandCodeCLIImageShape(big),
+			},
+		},
+	}
+	commandCodeOffloadImagesInPlace(messages)
+	content := messages[0].(map[string]any)["content"].([]any)
+	omitted := 0
+	kept := 0
+	for _, part := range content {
+		block := part.(map[string]any)
+		if block["type"] == "text" && block["text"] == commandCodeImageOmitted {
+			omitted++
+		}
+		if block["type"] == "image" {
+			kept++
+		}
+	}
+	if omitted == 0 {
+		t.Fatalf("expected some images offloaded, content=%#v", content)
+	}
+	if kept == 0 {
+		t.Fatalf("expected at least one image kept under budget")
+	}
+}
+
+func TestBuildCommandCodeOpenAIBody(t *testing.T) {
+	payload := []byte(`{
+		"messages":[
+			{"role":"system","content":"sys"},
+			{"role":"assistant","content":"","reasoning_content":"r","tool_calls":[{"id":"c1","type":"function","function":{"name":"T","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"c1","content":"done"},
+			{"role":"user","content":"hi"}
+		],
+		"tools":[{"type":"function","function":{"name":"T","parameters":{"properties":{}}}}]
+	}`)
+	raw, err := buildCommandCodeOpenAIBody("deepseek/deepseek-v4.1-flash", payload, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gjson.GetBytes(raw, "stream").Bool() {
+		t.Fatal("stream want true")
+	}
+	foundReasoning := false
+	gjson.GetBytes(raw, "messages").ForEach(func(_, m gjson.Result) bool {
+		if m.Get("reasoning_content").String() == "r" {
+			foundReasoning = true
+		}
+		return true
+	})
+	if !foundReasoning {
+		t.Fatalf("missing reasoning_content in body: %s", raw)
+	}
+	if gjson.GetBytes(raw, "tools.0.function.parameters.type").String() != "object" {
+		t.Fatalf("tool schema not normalized: %s", raw)
+	}
+}
+
+func TestIsCommandCodeUpgradeRequired(t *testing.T) {
+	if !isCommandCodeUpgradeRequired(403, []byte(`{"error":{"code":"upgrade_required"}}`)) {
+		t.Fatal("expected upgrade_required")
+	}
+	if isCommandCodeUpgradeRequired(500, []byte(`internal`)) {
+		t.Fatal("500 without upgrade_required should be false")
 	}
 }
