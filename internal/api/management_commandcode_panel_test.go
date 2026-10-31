@@ -66,20 +66,14 @@ func TestPatchManagementHTMLInjectsAPIKeyImport(t *testing.T) {
 	if !strings.Contains(out, "oauth/import?provider=commandcode") {
 		t.Fatalf("missing commandcode API key import patch:\n%s", out)
 	}
-	if !strings.Contains(out, "cc-apikey-keep") || !strings.Contains(out, "cc-apikey-form") {
-		t.Fatal("missing single-dialog API key form marker")
+	if !strings.Contains(out, "cc-apikey-overlay") || !strings.Contains(out, "data-cc-apikey-overlay") {
+		t.Fatal("missing fixed API key overlay marker")
 	}
-	if strings.Contains(out, "setTimeout(()=>boot(0),0)})():W.get") {
-		t.Fatal("broken IIFE closing paren would white-screen the panel")
-	}
-	if !strings.Contains(out, "setTimeout(()=>boot(0),0)}))():W.get") {
-		t.Fatal("startAuth IIFE must close the grouping paren before invoke")
+	if strings.Contains(out, "cc-apikey-keep") || strings.Contains(out, "OAuthFlowDialog-module__dialog___-utWI") {
+		t.Fatal("must not rewrite stock OAuth dialog DOM")
 	}
 	if strings.Contains(out, "prompt(`Command Code API Key") || strings.Contains(out, "window.prompt") {
 		t.Fatal("browser prompt() must not be used for API key input")
-	}
-	if strings.Contains(out, "cc-apikey-modal") {
-		t.Fatal("must not open a second modal overlay")
 	}
 	if strings.Contains(out, "浏览器登录请留空") || strings.Contains(out, "r.callback=") {
 		t.Fatal("browser OAuth path should be removed from startAuth")
@@ -93,9 +87,6 @@ func TestPatchManagementHTMLInjectsAPIKeyImport(t *testing.T) {
 	if !strings.Contains(out, "commandcode_oauth_button:`填写 API Key`") {
 		t.Fatal("missing zh button i18n")
 	}
-	if !strings.Contains(out, "OAuthFlowDialog-module__primary___6NInc") {
-		t.Fatal("form should reuse OAuth dialog button classes")
-	}
 }
 
 func TestPatchManagementHTMLUpgradesPromptToModal(t *testing.T) {
@@ -104,12 +95,24 @@ func TestPatchManagementHTMLUpgradesPromptToModal(t *testing.T) {
 	if strings.Contains(out, "prompt(`Command Code API Key") {
 		t.Fatal("legacy prompt() patch should be upgraded")
 	}
-	if !strings.Contains(out, "cc-apikey-keep") {
-		t.Fatal("upgraded patch should use single-dialog API key form")
+	if !strings.Contains(out, "cc-apikey-overlay") {
+		t.Fatal("upgraded patch should use fixed API key overlay")
 	}
 	again := string(patchManagementHTMLForCommandCode([]byte(out)))
 	if again != out {
 		t.Fatal("modal patch should be idempotent")
+	}
+}
+
+func TestPatchManagementHTMLUpgradesDialogRewriteToOverlay(t *testing.T) {
+	// Previous build rewrote the OAuth dialog in-place; must upgrade to overlay.
+	legacy := "startAuth:(e,t)=>{let n=by(e),r={provider:n};return Uee.has(n)&&(r.is_webui=!0),n===`commandcode`?(()=>new Promise((ok,no)=>{let x=`cc-apikey-keep`;W.post(`/oauth/import?provider=commandcode`,{api_key:`k`}).then(ok,no)}))():W.get(`/oauth/auth-url`,{params:r,...t?{signal:t}:{}})}"
+	out := string(patchManagementHTMLForCommandCode([]byte(legacy)))
+	if !strings.Contains(out, "cc-apikey-overlay") {
+		t.Fatal("expected upgrade to overlay")
+	}
+	if strings.Contains(out, "cc-apikey-keep") {
+		t.Fatal("legacy dialog rewrite marker should be gone")
 	}
 }
 
