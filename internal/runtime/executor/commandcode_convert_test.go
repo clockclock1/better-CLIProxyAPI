@@ -41,12 +41,21 @@ func TestBuildCommandCodeGenerateBodyNeutralWorkspace(t *testing.T) {
 	if body.Config.WorkingDir != "/" {
 		t.Fatalf("workingDir = %q, want neutral /", body.Config.WorkingDir)
 	}
-	if sys, ok := body.Params.System.(string); !ok || sys != "" {
-		t.Fatalf("system = %#v, want empty string (no proxy injection)", body.Params.System)
+	sections, ok := body.Params.System.([]any)
+	if !ok || len(sections) != 1 {
+		t.Fatalf("system = %#v, want single-space placeholder wire block", body.Params.System)
+	}
+	section, _ := sections[0].(map[string]any)
+	if section["type"] != "text" || section["text"] != " " {
+		t.Fatalf("system section = %#v, want text space placeholder", section)
+	}
+	if _, hasCache := section["cache_control"]; hasCache {
+		t.Fatalf("space placeholder must not set cache_control, got %#v", section)
 	}
 	if strings.Contains(string(raw), "Do not invent a working directory") ||
-		strings.Contains(string(raw), "Use only the tools provided in this request") {
-		t.Fatalf("proxy must not inject neutral system prompt, body=%s", raw)
+		strings.Contains(string(raw), "You are a helpful assistant") ||
+		strings.Contains(string(raw), "confident, efficient software engineer") {
+		t.Fatalf("proxy must not inject persona/system prose, body=%s", raw)
 	}
 	if body.Config.IsGitRepo || len(body.Config.Structure) != 0 || body.Config.GitStatus != "" {
 		t.Fatalf("workspace prompt fields must stay empty: %+v", body.Config)
@@ -96,6 +105,22 @@ func TestBuildCommandCodeGenerateBodyKeepsClientSystem(t *testing.T) {
 	assertCachedSystem(t, body.Params.System, "Cursor agent system prompt")
 	if body.Params.Tools == nil || len(body.Params.Tools) != 0 {
 		t.Fatalf("tools = %#v, want empty client tool list", body.Params.Tools)
+	}
+}
+
+func TestBuildCommandCodeGenerateBodyEmptySystemPlaceholderOff(t *testing.T) {
+	t.Setenv("COMMANDCODE_EMPTY_SYSTEM_PLACEHOLDER", "false")
+	payload := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	raw, err := buildCommandCodeGenerateBody("deepseek/deepseek-v4.1-flash", "", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body commandCodeGenerateBody
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	if sys, ok := body.Params.System.(string); !ok || sys != "" {
+		t.Fatalf("system = %#v, want empty string when placeholder disabled", body.Params.System)
 	}
 }
 

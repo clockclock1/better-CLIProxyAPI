@@ -57,8 +57,9 @@ func buildCommandCodeGenerateBody(model, threadID string, openaiPayload []byte) 
 	messages, system := openaiMessagesToCommandCode(openaiPayload)
 	commandCodeOffloadImagesInPlace(messages)
 	tools := openaiToolsToCommandCode(openaiPayload)
-	// Do not inject a proxy-owned system prompt. Only forward the client's
-	// system (if any); empty stays empty via commandCodeWireSystem.
+	// Forward client system as-is. When absent, commandCodeWireSystem may send
+	// a single-space wire block (MAXeaglet/commandcode-proxy #17) so upstream
+	// does not expand its ~7.5K-token default agent prompt.
 	// Claude-style rolling breakpoint: cache the prefix through the latest
 	// message, not only the system block. A system-only breakpoint leaves the
 	// growing transcript uncached.
@@ -318,6 +319,17 @@ func isCommandCodeEffort(value string) bool {
 func commandCodeWireSystem(system string) any {
 	system = strings.TrimSpace(system)
 	if system == "" {
+		// Same as commandcode-proxy emptySystemPlaceholder: a space text block
+		// prevents /alpha/generate from injecting the built-in agent identity
+		// (~7.5K tokens). Disable with COMMANDCODE_EMPTY_SYSTEM_PLACEHOLDER=false.
+		if commandCodeEmptySystemPlaceholderEnabled() {
+			return []any{
+				map[string]any{
+					"type": "text",
+					"text": " ",
+				},
+			}
+		}
 		return ""
 	}
 	return []any{
@@ -328,6 +340,19 @@ func commandCodeWireSystem(system string) any {
 				"type": "ephemeral",
 			},
 		},
+	}
+}
+
+func commandCodeEmptySystemPlaceholderEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("COMMANDCODE_EMPTY_SYSTEM_PLACEHOLDER"))
+	if v == "" {
+		return true
+	}
+	switch strings.ToLower(v) {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
 	}
 }
 
