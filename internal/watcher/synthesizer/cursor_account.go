@@ -45,9 +45,20 @@ func cursorAccountLooksLikeAuthFile(metadata map[string]any) bool {
 
 // normalizeCursorAuthMetadata flattens the IDE credential blob into the keys the
 // executor reads, so both file shapes behave identically downstream.
+//
+// It also strips fields the shared Auth struct would misread. Account tooling
+// writes `created_at`/`last_used` as Unix seconds, but Auth.CreatedAt is a
+// time.Time and rejects a number, which fails the whole file before the
+// synthesizer ever runs. Those values are descriptive only, so removing them is
+// safe and the framework fills in its own timestamps.
 func normalizeCursorAuthMetadata(metadata map[string]any) {
 	if metadata == nil {
 		return
+	}
+	for _, key := range []string{"created_at", "last_used", "usage_updated_at"} {
+		if value, isNum := metadata[key].(float64); isNum && value > 1_000_000_000 {
+			delete(metadata, key)
+		}
 	}
 	accessToken, _ := metadata["access_token"].(string)
 	refreshToken, _ := metadata["refresh_token"].(string)

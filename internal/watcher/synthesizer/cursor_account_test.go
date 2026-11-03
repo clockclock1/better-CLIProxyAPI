@@ -122,3 +122,34 @@ func cursorJWT() string {
 		"eyJzdWIiOiJhdXRoMHx1c2VyXzEiLCJpc3MiOiJodHRwczovL2F1dGhlbnRpY2F0aW9uLmN1cnNvci5zaCIsImV4cCI6MTc5ODc4ODc3MH0." +
 		"signature"
 }
+
+// TestCursorAccountWithUnixTimestamps loads: account tooling writes created_at
+// and last_used as Unix seconds, which the shared Auth struct rejects as a
+// created_at time.Time. That used to fail the whole file.
+func TestCursorAccountWithUnixTimestamps(t *testing.T) {
+	raw := cursorFixture(t, map[string]any{
+		"email":                  "ts@outlook.com",
+		"access_token":           cursorJWT(),
+		"refresh_token":          "refresh",
+		"created_at":             1793691861,
+		"last_used":              1793692165,
+		"usage_updated_at":       1793692165,
+		"tags":                   []any{},
+		"quota_query_last_error": nil,
+	})
+
+	ctx := &SynthesisContext{AuthDir: t.TempDir(), Now: time.Now()}
+	auths, errSynthesize := SynthesizeAuthFile(ctx, filepath.Join(ctx.AuthDir, "ts.json"), raw)
+	if errSynthesize != nil {
+		t.Fatalf("SynthesizeAuthFile() error = %v", errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("got %d auths, want 1", len(auths))
+	}
+	if auths[0].Provider != "cursor" {
+		t.Errorf("Provider = %q", auths[0].Provider)
+	}
+	if _, stillThere := auths[0].Metadata["created_at"]; stillThere {
+		t.Error("created_at should be stripped so Auth.CreatedAt parses")
+	}
+}
