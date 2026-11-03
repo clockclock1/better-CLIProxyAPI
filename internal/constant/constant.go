@@ -27,4 +27,7 @@ const (
 
 	// Interactions represents the Google Interactions API format identifier.
 	Interactions = "interactions"
+
+	// Cursor represents the Cursor agent backend provider identifier.
+	Cursor = "cursor"
 )

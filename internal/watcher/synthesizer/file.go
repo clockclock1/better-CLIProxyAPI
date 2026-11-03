@@ -111,6 +111,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
+	// Cursor account files are produced by external account tooling and carry no
+	// `type` field. Recognize them by their OAuth material so dropping such a
+	// file into the auth directory just works, then normalize the credential so
+	// the executor has a single place to read it from.
+	if provider == "" && cursorAccountLooksLikeAuthFile(metadata) {
+		provider = "cursor"
+		metadata["type"] = provider
+		normalizeCursorAuthMetadata(metadata)
+	}
 	if ctx.PluginAuthParser != nil {
 		auths, handled, errParse := parsePluginFileAuths(ctx.PluginAuthParser, pluginapi.AuthParseRequest{
 			Provider: provider,

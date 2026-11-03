@@ -531,6 +531,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetXAIModels()
 	case "devin":
 		return GetDevinModels()
+	case "cursor":
+		return GetCursorModels()
 	case "meta", "muse":
 		return GetMetaModels()
 	case "commandcode", "command-code", "command_code":
@@ -588,6 +590,7 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Antigravity,
 		data.XAI,
 		GetDevinModels(),
+		GetCursorModels(),
 		GetMetaModels(),
 		GetCommandCodeModels(),
 	}
