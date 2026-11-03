@@ -13,9 +13,11 @@ import (
 	"github.com/gin-gonic/gin"
 	commandcodeauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/commandcode"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	log "github.com/sirupsen/logrus"
 )
 
 // planMonthlyCredits mirrors Command Code harness PLAN_TOTAL_CREDITS.
@@ -327,7 +329,94 @@ func (h *Handler) fetchCommandCodeQuota(c *gin.Context, auth *coreauth.Auth) (pl
 		resp.Summary = summary
 	}
 
+	h.applyCommandCodeQuotaRouting(ctx, auth, buckets)
 	return resp, nil
+}
+
+// applyCommandCodeQuotaRouting stores window reset signals and cools credentials
+// whose displayed meters are already empty, so fill-first stops selecting them
+// before the next upstream refusal.
+func (h *Handler) applyCommandCodeQuotaRouting(ctx context.Context, auth *coreauth.Auth, buckets []pluginapi.QuotaBucket) {
+	if h == nil || h.authManager == nil || auth == nil || len(buckets) == 0 {
+		return
+	}
+	now := time.Now()
+	signals := map[string]string{}
+	var soonestReset time.Time
+	exhausted := false
+	allPositive := true
+	for _, bucket := range buckets {
+		key := ""
+		switch strings.ToLower(strings.TrimSpace(bucket.Window)) {
+		case "five_hour":
+			key = helps.CommandCodeQuotaSignalFiveHourReset
+		case "weekly":
+			key = helps.CommandCodeQuotaSignalWeeklyReset
+		case "monthly":
+			key = helps.CommandCodeQuotaSignalMonthlyReset
+		}
+		resetAt := time.Time{}
+		if raw := strings.TrimSpace(bucket.ResetTime); raw != "" {
+			if parsed, errParse := time.Parse(time.RFC3339, raw); errParse == nil {
+				resetAt = parsed
+			}
+		}
+		if key != "" && !resetAt.IsZero() {
+			signals[key] = resetAt.UTC().Format(time.RFC3339)
+		}
+		if bucket.RemainingFraction <= 0 {
+			exhausted = true
+			allPositive = false
+			if !resetAt.IsZero() && resetAt.After(now) && (soonestReset.IsZero() || resetAt.Before(soonestReset)) {
+				soonestReset = resetAt
+			}
+		}
+	}
+
+	delay := 30 * time.Minute
+	if exhausted && !soonestReset.IsZero() {
+		if d := soonestReset.Sub(now); d > 0 {
+			delay = d
+		}
+	}
+	recoverAt := now.Add(delay)
+
+	_, _, errModify := h.authManager.Modify(ctx, auth.ID, 0, func(current *coreauth.Auth) error {
+		if current.Quota.Signals == nil {
+			current.Quota.Signals = map[string]string{}
+		}
+		for key, value := range signals {
+			current.Quota.Signals[key] = value
+		}
+		if exhausted {
+			current.Quota.Exceeded = true
+			current.Quota.Reason = "credential_quota"
+			current.Quota.NextRecoverAt = recoverAt
+			current.NextRetryAfter = recoverAt
+			current.Unavailable = true
+			current.Status = coreauth.StatusError
+			current.StatusMessage = "commandcode window exhausted"
+			return nil
+		}
+		if allPositive && current.Quota.Exceeded && current.Quota.Reason == "credential_quota" {
+			current.Quota.Exceeded = false
+			current.Quota.Reason = ""
+			current.Quota.NextRecoverAt = time.Time{}
+			current.Quota.BackoffLevel = 0
+			current.NextRetryAfter = time.Time{}
+			current.Unavailable = false
+			if current.Status == coreauth.StatusError {
+				current.Status = coreauth.StatusActive
+			}
+			if current.StatusMessage == "commandcode window exhausted" {
+				current.StatusMessage = ""
+			}
+		}
+		return nil
+	})
+	if errModify != nil {
+		log.WithError(errModify).Debugf("commandcode quota: failed to apply routing state for %s", auth.ID)
+	}
 }
 
 func commandCodeWindowToBucket(window, displayName, labelCN string, src *commandCodeWindowBucket) (pluginapi.QuotaBucket, bool) {

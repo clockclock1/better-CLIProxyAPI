@@ -32,6 +32,35 @@ var (
 
 const commandCodeStreamKeepAlive = 15 * time.Second
 
+// commandCodeStatusError classifies upstream failures. Account-wide quota and
+// billing refusals become credential-scoped 429s so fill-first / rotation can
+// cool the exhausted Go account and retry a sibling credential in the same round.
+func commandCodeStatusError(status int, body []byte, headers http.Header, auth *cliproxyauth.Auth) statusErr {
+	msg := string(body)
+	err := statusErr{code: status, msg: msg}
+	if headers != nil {
+		if retryAfter := parseRetryAfterHeader(headers, time.Now()); retryAfter != nil {
+			err.retryAfter = retryAfter
+		}
+	}
+	if !helps.CommandCodeQuotaExhausted(status, msg) {
+		return err
+	}
+	err.credentialScoped = true
+	// MarkResult only wraps every model under credential_quota for 429.
+	if err.code != http.StatusTooManyRequests {
+		err.code = http.StatusTooManyRequests
+	}
+	if err.retryAfter == nil && auth != nil {
+		err.retryAfter = helps.CommandCodeQuotaRetryAfter(auth.Quota.Signals, time.Now())
+	}
+	return err
+}
+
+func commandCodeStreamError(msg string, auth *cliproxyauth.Auth) statusErr {
+	return commandCodeStatusError(http.StatusBadGateway, []byte(strings.TrimSpace(msg)), nil, auth)
+}
+
 // CommandCodeExecutor routes OpenAI-compatible chat requests through Command Code
 // (/alpha/generate, /provider/v1/chat/completions, or /provider/v1/messages).
 type CommandCodeExecutor struct {
@@ -136,11 +165,11 @@ func (e *CommandCodeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		maybeLearnCommandCodeMaxTokens(baseModel, b)
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = commandCodeStatusError(httpResp.StatusCode, b, httpResp.Header, auth)
 		return resp, err
 	}
 
-	openaiJSON, errAgg := aggregateCommandCodeResponse(protocol, baseModel, httpResp.Body)
+	openaiJSON, errAgg := aggregateCommandCodeResponse(protocol, baseModel, httpResp.Body, auth)
 	if errAgg != nil {
 		err = errAgg
 		return resp, err
@@ -195,7 +224,7 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		_ = httpResp.Body.Close()
 		maybeLearnCommandCodeMaxTokens(baseModel, b)
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = commandCodeStatusError(httpResp.StatusCode, b, httpResp.Header, auth)
 		return nil, err
 	}
 
@@ -234,11 +263,11 @@ func (e *CommandCodeExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 		switch protocol {
 		case commandCodeProtocolOpenAI:
-			streamCommandCodeOpenAI(ctx, httpResp.Body, emitOpenAI, emitDone, reporter, out)
+			streamCommandCodeOpenAI(ctx, httpResp.Body, emitOpenAI, emitDone, reporter, out, auth)
 		case commandCodeProtocolMessages:
-			streamCommandCodeMessages(ctx, baseModel, httpResp.Body, emitOpenAI, emitDone, reporter, out)
+			streamCommandCodeMessages(ctx, baseModel, httpResp.Body, emitOpenAI, emitDone, reporter, out, auth)
 		default:
-			streamCommandCodeCLI(ctx, baseModel, httpResp.Body, emitOpenAI, emitDone, reporter, out)
+			streamCommandCodeCLI(ctx, baseModel, httpResp.Body, emitOpenAI, emitDone, reporter, out, auth)
 		}
 	}()
 
@@ -351,7 +380,7 @@ func buildCommandCodeBody(protocol, model, sessionID string, openaiPayload []byt
 	}
 }
 
-func aggregateCommandCodeResponse(protocol, model string, body io.Reader) ([]byte, error) {
+func aggregateCommandCodeResponse(protocol, model string, body io.Reader, auth *cliproxyauth.Auth) ([]byte, error) {
 	switch protocol {
 	case commandCodeProtocolOpenAI:
 		b, err := io.ReadAll(body)
@@ -375,7 +404,7 @@ func aggregateCommandCodeResponse(protocol, model string, body io.Reader) ([]byt
 				continue
 			}
 			if errIngest := acc.ingest(event); errIngest != nil {
-				return nil, statusErr{code: http.StatusBadGateway, msg: errIngest.Error()}
+				return nil, commandCodeStreamError(errIngest.Error(), auth)
 			}
 		}
 		if errScan := scanner.Err(); errScan != nil {
@@ -393,6 +422,7 @@ func streamCommandCodeCLI(
 	emitDone func(),
 	reporter *helps.UsageReporter,
 	out chan<- cliproxyexecutor.StreamChunk,
+	auth *cliproxyauth.Auth,
 ) {
 	acc := newCommandCodeOpenAIAccumulator(model)
 	if !emit(acc.streamChunk(map[string]any{"role": "assistant", "content": ""}, nil)) {
@@ -484,7 +514,7 @@ func streamCommandCodeCLI(
 	}
 	failTool := func(err error) {
 		select {
-		case out <- cliproxyexecutor.StreamChunk{Err: statusErr{code: http.StatusBadGateway, msg: err.Error()}}:
+		case out <- cliproxyexecutor.StreamChunk{Err: commandCodeStreamError(err.Error(), auth)}:
 		case <-ctx.Done():
 		}
 	}
@@ -533,7 +563,7 @@ func streamCommandCodeCLI(
 			case "error":
 				if errIngest := acc.ingest(event); errIngest != nil {
 					select {
-					case out <- cliproxyexecutor.StreamChunk{Err: statusErr{code: http.StatusBadGateway, msg: errIngest.Error()}}:
+					case out <- cliproxyexecutor.StreamChunk{Err: commandCodeStreamError(errIngest.Error(), auth)}:
 					case <-ctx.Done():
 					}
 					return
@@ -637,6 +667,7 @@ func streamCommandCodeOpenAI(
 	emitDone func(),
 	reporter *helps.UsageReporter,
 	out chan<- cliproxyexecutor.StreamChunk,
+	auth *cliproxyauth.Auth,
 ) {
 	type lineResult struct {
 		line []byte
@@ -712,6 +743,13 @@ func streamCommandCodeOpenAI(
 			if !json.Valid(payload) {
 				continue
 			}
+			if errMsg := openAICompatStreamErrorMessage(payload); errMsg != "" {
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: commandCodeStreamError(errMsg, auth)}:
+				case <-ctx.Done():
+				}
+				return
+			}
 			normalized := normalizeOpenAIReasoningDelta(payload)
 			if gjson.GetBytes(normalized, "usage").Exists() {
 				lastUsage = normalized
@@ -722,6 +760,20 @@ func streamCommandCodeOpenAI(
 			}
 		}
 	}
+}
+
+func openAICompatStreamErrorMessage(payload []byte) string {
+	if !gjson.GetBytes(payload, "error").Exists() {
+		return ""
+	}
+	msg := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
+	if msg == "" {
+		msg = strings.TrimSpace(gjson.GetBytes(payload, "error").String())
+	}
+	if msg == "" || msg == "{}" || msg == "null" {
+		msg = "upstream stream error"
+	}
+	return msg
 }
 
 func normalizeOpenAIReasoningDelta(chunk []byte) []byte {
@@ -769,6 +821,7 @@ func streamCommandCodeMessages(
 	emitDone func(),
 	reporter *helps.UsageReporter,
 	out chan<- cliproxyexecutor.StreamChunk,
+	auth *cliproxyauth.Auth,
 ) {
 	acc := newCommandCodeOpenAIAccumulator(model)
 	if !emit(acc.streamChunk(map[string]any{"role": "assistant", "content": ""}, nil)) {
@@ -842,6 +895,19 @@ func streamCommandCodeMessages(
 			}
 			evType := gjson.GetBytes(payload, "type").String()
 			switch evType {
+			case "error":
+				msg := strings.TrimSpace(gjson.GetBytes(payload, "error.message").String())
+				if msg == "" {
+					msg = strings.TrimSpace(gjson.GetBytes(payload, "message").String())
+				}
+				if msg == "" {
+					msg = "upstream stream error"
+				}
+				select {
+				case out <- cliproxyexecutor.StreamChunk{Err: commandCodeStreamError(msg, auth)}:
+				case <-ctx.Done():
+				}
+				return
 			case "ping":
 				if !emit(acc.streamChunk(map[string]any{"content": ""}, nil)) {
 					return

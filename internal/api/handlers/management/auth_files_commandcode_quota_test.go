@@ -3,10 +3,12 @@ package management
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -106,6 +108,66 @@ func TestFetchCredentialQuota_CommandCodeBuiltin(t *testing.T) {
 	}
 	if got := quotaResp.Groups[0].Buckets[2].RemainingFraction; got != 0.75 {
 		t.Fatalf("monthly remaining = %v, want 0.75", got)
+	}
+	live, ok := manager.GetByID(auth.ID)
+	if !ok || live == nil || live.Quota.Signals["five_hour_quota_reset_at"] == "" {
+		t.Fatalf("expected five_hour reset signal on auth, got %+v", live)
+	}
+}
+
+func TestFetchCredentialQuota_CommandCodeExhaustedWindowCoolsCredential(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetAt := time.Now().Add(2 * time.Hour).UTC().UnixMilli()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/alpha/billing/credits"):
+			_, _ = w.Write([]byte(fmt.Sprintf(
+				`{"credits":{"planId":"individual-go-v1","monthlyCredits":8,"purchasedCredits":0,"freeCredits":0},"windowLimits":{"limited":true,"fiveHour":{"used":3,"cap":3,"exceeded":true,"resetAt":%d},"weekly":{"used":1,"cap":6,"exceeded":false,"resetAt":%d}}}`,
+				resetAt, resetAt+86_400_000,
+			)))
+		case strings.HasSuffix(r.URL.Path, "/alpha/billing/subscriptions"):
+			_, _ = w.Write([]byte(`{"data":{"planId":"individual-go-v1","status":"active","currentPeriodEnd":"2026-12-01T00:00:00Z"}}`))
+		case strings.HasSuffix(r.URL.Path, "/alpha/usage/summary"):
+			_, _ = w.Write([]byte(`{"totalCost":2}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "commandcode-exhausted.json",
+		FileName: "commandcode-exhausted.json",
+		Provider: "commandcode",
+		Metadata: map[string]any{"api_key": "cc-test-key", "base_url": upstream.URL},
+		Attributes: map[string]string{"api_key": "cc-test-key", "base_url": upstream.URL},
+	}
+	authIndex := auth.EnsureIndex()
+	_, _ = manager.Register(context.Background(), auth)
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
+	h.SetPluginHost(pluginhost.New())
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v0/management/quota/fetch", strings.NewReader(`{"auth_index":"`+authIndex+`"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	h.FetchCredentialQuota(ctx)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	live, ok := manager.GetByID(auth.ID)
+	if !ok || live == nil {
+		t.Fatal("auth missing after quota fetch")
+	}
+	if !live.Quota.Exceeded || live.Quota.Reason != "credential_quota" {
+		t.Fatalf("expected credential_quota cooldown, got %+v", live.Quota)
+	}
+	if live.Quota.NextRecoverAt.Before(time.Now().Add(time.Hour)) {
+		t.Fatalf("expected cooldown until five-hour reset, got %v", live.Quota.NextRecoverAt)
 	}
 }
 

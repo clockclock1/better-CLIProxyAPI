@@ -106,7 +106,7 @@ func TestCommandCodeCLIStreamToolArguments(t *testing.T) {
 					return true
 				})
 				return true
-			}, func() { done = true }, helps.NewUsageReporter(ctx, "commandcode", "deepseek/deepseek-v4.1-flash", nil), errors)
+			}, func() { done = true }, helps.NewUsageReporter(ctx, "commandcode", "deepseek/deepseek-v4.1-flash", nil), errors, nil)
 			select {
 			case chunk := <-errors:
 				t.Fatalf("stream error: %v", chunk.Err)
@@ -169,7 +169,7 @@ func TestCommandCodeCLIStreamRejectsIncompleteToolInput(t *testing.T) {
 					finished = true
 				}
 				return true
-			}, func() { done = true }, helps.NewUsageReporter(ctx, "commandcode", "test", nil), errors)
+			}, func() { done = true }, helps.NewUsageReporter(ctx, "commandcode", "test", nil), errors, nil)
 			if done || finished {
 				t.Fatal("incomplete tool input must not finish as a successful tool call")
 			}
