@@ -67,3 +67,8 @@ docker-compose.override.yml
 
 # Local LLM Wiki vault
 .llm-wiki
+
+# local runtime logs and test scripts
+_server*.log
+_smoke_*.mjs
+_bulk_*.mjs
