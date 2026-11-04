@@ -711,6 +711,15 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 			}
 		}
 	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "cursor") {
+		entry["supports_quota"] = true
+		entry["quota_provider"] = "cursor"
+		if quota.v8 {
+			if _, hasPlugin := entry["quota_plugin_id"]; !hasPlugin {
+				entry["quota_plugin_id"] = builtinCursorQuotaPluginID
+			}
+		}
+	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
 	}

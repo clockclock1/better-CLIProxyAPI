@@ -23,6 +23,10 @@ import (
 // for the in-process Command Code quota implementation (no external plugin).
 const builtinCommandCodeQuotaPluginID = "builtin-commandcode"
 
+// builtinCursorQuotaPluginID is the synthetic plugin id for in-process Cursor
+// GetCurrentPeriodUsage quota (no external plugin).
+const builtinCursorQuotaPluginID = "builtin-cursor"
+
 type credentialQuotaRequest struct {
 	AuthIndexSnake  *string `json:"auth_index"`
 	AuthIndexCamel  *string `json:"authIndex"`
@@ -46,13 +50,22 @@ func (r credentialQuotaRequest) resolveAuthIndex() string {
 
 // GetQuotaProviders returns the list of registered quota providers.
 func (h *Handler) GetQuotaProviders(c *gin.Context) {
-	builtin := []gin.H{{
-		"plugin_id":           builtinCommandCodeQuotaPluginID,
-		"provider":            "commandcode",
-		"display_name":        "Command Code",
-		"supported_providers": []string{"commandcode"},
-		"supports_reset":      false,
-	}}
+	builtin := []gin.H{
+		{
+			"plugin_id":           builtinCommandCodeQuotaPluginID,
+			"provider":            "commandcode",
+			"display_name":        "Command Code",
+			"supported_providers": []string{"commandcode"},
+			"supports_reset":      false,
+		},
+		{
+			"plugin_id":           builtinCursorQuotaPluginID,
+			"provider":            "cursor",
+			"display_name":        "Cursor",
+			"supported_providers": []string{"cursor"},
+			"supports_reset":      false,
+		},
+	}
 	if h == nil {
 		c.JSON(http.StatusOK, gin.H{"providers": builtin})
 		return
@@ -65,8 +78,10 @@ func (h *Handler) GetQuotaProviders(c *gin.Context) {
 		return
 	}
 	providers := host.QuotaProviders(c.Request.Context())
-	out := make([]any, 0, len(providers)+1)
-	out = append(out, builtin[0])
+	out := make([]any, 0, len(providers)+len(builtin))
+	for _, b := range builtin {
+		out = append(out, b)
+	}
 	for _, p := range providers {
 		out = append(out, p)
 	}
@@ -152,6 +167,18 @@ func (h *Handler) FetchCredentialQuota(c *gin.Context) {
 		if errCC != nil {
 			log.WithError(errCC).Warnf("failed to fetch Command Code quota for credential %s", auth.Index)
 			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errCC)})
+			return
+		}
+		c.JSON(http.StatusOK, quotaResp)
+		return
+	}
+
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "cursor") ||
+		strings.EqualFold(strings.TrimSpace(provider), "cursor") {
+		quotaResp, errCur := h.fetchCursorQuota(c, auth)
+		if errCur != nil {
+			log.WithError(errCur).Warnf("failed to fetch Cursor quota for credential %s", auth.Index)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errCur)})
 			return
 		}
 		c.JSON(http.StatusOK, quotaResp)
@@ -311,6 +338,21 @@ func (h *Handler) fetchQuotaForPlugin(c *gin.Context, pluginID, authIndex string
 		if errCC != nil {
 			log.WithError(errCC).Warnf("failed to fetch Command Code quota for credential %s", auth.Index)
 			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errCC)})
+			return
+		}
+		c.JSON(http.StatusOK, quotaResp)
+		return
+	}
+	if pluginID == builtinCursorQuotaPluginID ||
+		(pluginID == "" && strings.EqualFold(strings.TrimSpace(auth.Provider), "cursor")) {
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "cursor") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "builtin-cursor only supports cursor credentials"})
+			return
+		}
+		quotaResp, errCur := h.fetchCursorQuota(c, auth)
+		if errCur != nil {
+			log.WithError(errCur).Warnf("failed to fetch Cursor quota for credential %s", auth.Index)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to fetch quota: %v", errCur)})
 			return
 		}
 		c.JSON(http.StatusOK, quotaResp)
