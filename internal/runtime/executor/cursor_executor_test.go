@@ -2,9 +2,12 @@ package executor
 
 import (
 	"encoding/json"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // TestCursorPromptFlattening covers the transcript Cursor receives: system
@@ -188,6 +191,95 @@ func contains(haystack, needle string) bool {
 
 func startsWith(value, prefix string) bool {
 	return len(value) >= len(prefix) && value[:len(prefix)] == prefix
+}
+
+// TestCursorPrepareRequestPerAccountMachine covers the proxy-wide guarantee that
+// every account reaches Cursor as its own machine: the checksum must carry that
+// account's machine id, and two accounts must never share one.
+func TestCursorPrepareRequestPerAccountMachine(t *testing.T) {
+	exec := NewCursorExecutor(nil)
+
+	machineOf := func(email, token string) string {
+		auth := &cliproxyauth.Auth{
+			Provider:   cursor.Provider,
+			Attributes: map[string]string{"access_token": token, "email": email},
+			Metadata:   map[string]any{"email": email, "access_token": token},
+		}
+		req, errReq := http.NewRequest(http.MethodPost, "https://agentn.global.api5.cursor.sh"+cursor.AgentPath, nil)
+		if errReq != nil {
+			t.Fatalf("build request: %v", errReq)
+		}
+		if errPrep := exec.PrepareRequest(req, auth); errPrep != nil {
+			t.Fatalf("prepare request: %v", errPrep)
+		}
+		checksum := req.Header.Get(cursor.HeaderChecksum)
+		if len(checksum) <= 64 {
+			t.Fatalf("checksum %q does not carry a machine id", checksum)
+		}
+		machine := checksum[len(checksum)-64:]
+		if want := cursor.MachineID(email); machine != want {
+			t.Errorf("checksum machine id = %q, want %q", machine, want)
+		}
+		if req.Header.Get(cursor.HeaderClientKey) == "" || req.Header.Get(cursor.HeaderSessionID) == "" {
+			t.Errorf("identity headers incomplete: %v", req.Header)
+		}
+		if got := req.Header.Get("X-Cursor-Client-Type"); got != "cli" {
+			t.Errorf("client type = %q, want cli", got)
+		}
+		if got := req.Header.Get("X-Ghost-Mode"); got != "true" {
+			t.Errorf("ghost mode = %q, want true", got)
+		}
+		return machine
+	}
+
+	first := machineOf("alpha@example.com", "token-a")
+	second := machineOf("beta@example.com", "token-b")
+	if first == second {
+		t.Fatalf("two accounts share a machine id: %q", first)
+	}
+	if again := machineOf("alpha@example.com", "token-a"); again != first {
+		t.Fatalf("machine id is not stable for one account: %q vs %q", again, first)
+	}
+}
+
+// TestCursorPrepareRequestHonoursPinnedMachineID covers the per-account override
+// an operator can put in an auth file.
+func TestCursorPrepareRequestHonoursPinnedMachineID(t *testing.T) {
+	exec := NewCursorExecutor(nil)
+	pinned := strings.Repeat("ab", 32)
+	auth := &cliproxyauth.Auth{
+		Provider:   cursor.Provider,
+		Attributes: map[string]string{"access_token": "token-a"},
+		Metadata:   map[string]any{"email": "alpha@example.com", "machine_id": pinned},
+	}
+	req, errReq := http.NewRequest(http.MethodPost, "https://example.invalid", nil)
+	if errReq != nil {
+		t.Fatalf("build request: %v", errReq)
+	}
+	if errPrep := exec.PrepareRequest(req, auth); errPrep != nil {
+		t.Fatalf("prepare request: %v", errPrep)
+	}
+	if got := req.Header.Get(cursor.HeaderChecksum); !strings.HasSuffix(got, pinned) {
+		t.Errorf("checksum = %q, want the pinned machine id suffix", got)
+	}
+}
+
+// TestCursorPrepareRequestWithoutIdentity keeps a token-less auth harmless.
+func TestCursorPrepareRequestWithoutIdentity(t *testing.T) {
+	exec := NewCursorExecutor(nil)
+	req, errReq := http.NewRequest(http.MethodPost, "https://example.invalid", nil)
+	if errReq != nil {
+		t.Fatalf("build request: %v", errReq)
+	}
+	if errPrep := exec.PrepareRequest(req, nil); errPrep != nil {
+		t.Fatalf("prepare request: %v", errPrep)
+	}
+	if got := req.Header.Get(cursor.HeaderChecksum); got != "" {
+		t.Errorf("checksum = %q, want none without an auth", got)
+	}
+	if got := req.Header.Get("X-Cursor-Client-Type"); got != "cli" {
+		t.Errorf("client type = %q, want cli", got)
+	}
 }
 
 func indexOf(haystack, needle string) int {

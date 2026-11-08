@@ -61,6 +61,7 @@ func (e *CursorExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Au
 	req.Header.Set("X-Cursor-Client-Type", "cli")
 	req.Header.Set("X-Cursor-Client-Version", cursor.DefaultClientVersion)
 	req.Header.Set("X-Ghost-Mode", "true")
+	cursorIdentityHeaders(req.Header, auth, token)
 	return nil
 }
 
@@ -206,11 +207,12 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		var text strings.Builder
 		var terminalErr *cursor.RunError
 		var translateParam any
+		// Tool replies are a single JSON object in the final text. Streaming that
+		// object as content and then finishing with "stop" makes clients drop the
+		// turn, so buffer until the run ends whenever tools were declared.
+		bufferForTools := cursorRequestDeclaresTools(req.Payload)
 
-		emitText := func(delta string) bool {
-			// Route deltas through the shared translator so the emitted SSE
-			// matches whatever format the client asked for.
-			chunk := buildOpenAIStreamChunk(req.Model, delta, false)
+		emitSSE := func(chunk []byte) bool {
 			lines := sdktranslator.TranslateStream(
 				streamCtx,
 				sdktranslator.FormatOpenAI,
@@ -229,6 +231,10 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 				}
 			}
 			return true
+		}
+
+		emitText := func(delta string) bool {
+			return emitSSE(buildOpenAIStreamChunk(req.Model, delta, false))
 		}
 
 		for {
@@ -252,6 +258,9 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 						continue
 					}
 					text.WriteString(event.TextDelta)
+					if bufferForTools {
+						continue
+					}
 					if !emitText(event.TextDelta) {
 						return
 					}
@@ -272,6 +281,26 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			out <- cliproxyexecutor.StreamChunk{Err: cursorStatusErrorForRun(terminalErr, httpResp.StatusCode, httpResp.Header)}
 			return
 		}
+
+		finalText := text.String()
+		if bufferForTools {
+			if calls, ok := parseCursorToolCalls(finalText); ok {
+				for _, chunk := range buildOpenAIToolCallStreamChunks(req.Model, calls) {
+					if !emitSSE(chunk) {
+						return
+					}
+				}
+				reporter.Publish(streamCtx, helps.ParseInteractionsUsage([]byte(finalText)))
+				return
+			}
+			// Tools were declared but the model answered in prose: flush the
+			// buffered answer now so the client still sees the text.
+			if finalText != "" {
+				if !emitText(finalText) {
+					return
+				}
+			}
+		}
 		for _, line := range sdktranslator.TranslateStream(
 			streamCtx,
 			sdktranslator.FormatOpenAI,
@@ -285,7 +314,7 @@ func (e *CursorExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			out <- cliproxyexecutor.StreamChunk{Payload: line}
 		}
 
-		reporter.Publish(streamCtx, helps.ParseInteractionsUsage([]byte(text.String())))
+		reporter.Publish(streamCtx, helps.ParseInteractionsUsage([]byte(finalText)))
 	}()
 
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
@@ -501,6 +530,12 @@ func cursorPromptFromPayload(payload []byte) string {
 		blocks = append(blocks, declaration)
 	}
 	return strings.TrimSpace(strings.Join(blocks, "\n\n"))
+}
+
+// cursorRequestDeclaresTools reports whether the OpenAI request carries tools.
+func cursorRequestDeclaresTools(payload []byte) bool {
+	tools := gjson.GetBytes(payload, "tools")
+	return tools.Exists() && tools.IsArray() && len(tools.Array()) > 0
 }
 
 // cursorToolDeclaration renders the client's tool schemas for the prompt.
@@ -727,6 +762,65 @@ func buildOpenAIStreamChunk(model, content string, done bool) []byte {
 	}
 	encoded, _ := json.Marshal(chunk)
 	return []byte("data: " + string(encoded) + "\n\n")
+}
+
+// buildOpenAIToolCallStreamChunks emits OpenAI SSE frames for a tool-call turn.
+//
+// One chunk carries every tool call (name + full arguments), then a final chunk
+// finishes with finish_reason=tool_calls. Clients that stream Cursor through this
+// proxy expect that shape; finishing with "stop" after JSON content drops the turn.
+func buildOpenAIToolCallStreamChunks(model string, calls []cursorToolCall) [][]byte {
+	if len(calls) == 0 {
+		return nil
+	}
+	toolCalls := make([]any, 0, len(calls))
+	for i, call := range calls {
+		arguments := strings.TrimSpace(string(call.Arguments))
+		if arguments == "" {
+			arguments = "{}"
+		}
+		toolCalls = append(toolCalls, map[string]any{
+			"index": i,
+			"id":    fmt.Sprintf("call_%d_%s", i, shortHash(call.Name+arguments)),
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": arguments,
+			},
+		})
+	}
+	open := map[string]any{
+		"object": "chat.completion.chunk",
+		"model":  model,
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"delta": map[string]any{
+					"role":       "assistant",
+					"content":    nil,
+					"tool_calls": toolCalls,
+				},
+				"finish_reason": nil,
+			},
+		},
+	}
+	done := map[string]any{
+		"object": "chat.completion.chunk",
+		"model":  model,
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"delta":         map[string]any{},
+				"finish_reason": "tool_calls",
+			},
+		},
+	}
+	openRaw, _ := json.Marshal(open)
+	doneRaw, _ := json.Marshal(done)
+	return [][]byte{
+		[]byte("data: " + string(openRaw) + "\n\n"),
+		[]byte("data: " + string(doneRaw) + "\n\n"),
+	}
 }
 
 func logCloseError(err error) {

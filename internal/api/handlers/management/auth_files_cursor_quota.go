@@ -34,23 +34,23 @@ type cursorPlanUsage struct {
 }
 
 type cursorSpendLimitUsage struct {
-	PooledLimit       json.RawMessage `json:"pooledLimit"`
-	PooledRemaining   json.RawMessage `json:"pooledRemaining"`
-	IndividualLimit   float64         `json:"individualLimit"`
-	LimitType         string          `json:"limitType"`
-	OverallLimit      float64         `json:"overallLimit"`
-	OverallRemaining  float64         `json:"overallRemaining"`
+	PooledLimit      json.RawMessage `json:"pooledLimit"`
+	PooledRemaining  json.RawMessage `json:"pooledRemaining"`
+	IndividualLimit  float64         `json:"individualLimit"`
+	LimitType        string          `json:"limitType"`
+	OverallLimit     float64         `json:"overallLimit"`
+	OverallRemaining float64         `json:"overallRemaining"`
 }
 
 type cursorCurrentPeriodUsage struct {
-	BillingCycleStart                  string                 `json:"billingCycleStart"`
-	BillingCycleEnd                    string                 `json:"billingCycleEnd"`
-	PlanUsage                          *cursorPlanUsage       `json:"planUsage"`
-	SpendLimitUsage                    *cursorSpendLimitUsage `json:"spendLimitUsage"`
-	DisplayThreshold                   float64                `json:"displayThreshold"`
-	DisplayMessage                     string                 `json:"displayMessage"`
-	AutoModelSelectedDisplayMessage    string                 `json:"autoModelSelectedDisplayMessage"`
-	NamedModelSelectedDisplayMessage   string                 `json:"namedModelSelectedDisplayMessage"`
+	BillingCycleStart                string                 `json:"billingCycleStart"`
+	BillingCycleEnd                  string                 `json:"billingCycleEnd"`
+	PlanUsage                        *cursorPlanUsage       `json:"planUsage"`
+	SpendLimitUsage                  *cursorSpendLimitUsage `json:"spendLimitUsage"`
+	DisplayThreshold                 float64                `json:"displayThreshold"`
+	DisplayMessage                   string                 `json:"displayMessage"`
+	AutoModelSelectedDisplayMessage  string                 `json:"autoModelSelectedDisplayMessage"`
+	NamedModelSelectedDisplayMessage string                 `json:"namedModelSelectedDisplayMessage"`
 }
 
 func cursorAPIBase(auth *coreauth.Auth) string {
@@ -155,6 +155,9 @@ func (h *Handler) fetchCursorQuota(c *gin.Context, auth *coreauth.Auth) (plugina
 	req.Header.Set("X-Cursor-Client-Type", "cli")
 	req.Header.Set("X-Cursor-Client-Version", cursorauth.DefaultClientVersion)
 	req.Header.Set("X-Ghost-Mode", "true")
+	// Report the account's own machine identity so the quota probe is attributed
+	// to the same machine the chat executor uses for this account.
+	cursorauth.SetIdentityHeaders(req.Header, cursorauth.IdentityFor(auth.Metadata, auth.Attributes, token, time.Now()))
 
 	client := h.cursorHTTPClient(c, auth)
 	resp, errDo := client.Do(req)

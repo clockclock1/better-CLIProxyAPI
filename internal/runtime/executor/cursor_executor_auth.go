@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/cursor"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -137,4 +138,18 @@ func cursorCredentials(auth *cliproxyauth.Auth) (token string, agentBase string,
 		return "", agentBase, fmt.Errorf("cursor: access token missing")
 	}
 	return token, agentBase, nil
+}
+
+// cursorIdentityHeaders stamps the account's own machine identity on a request.
+//
+// Cursor fingerprints requests by machine, so every account gets the id derived
+// from its own identity: two accounts proxied from one host never present the
+// same machine. Accounts whose identity cannot be derived are left untouched and
+// keep their existing headers.
+func cursorIdentityHeaders(header http.Header, auth *cliproxyauth.Auth, token string) {
+	if header == nil || auth == nil {
+		return
+	}
+	identity := cursor.IdentityFor(auth.Metadata, auth.Attributes, token, time.Now())
+	cursor.SetIdentityHeaders(header, identity)
 }

@@ -2,7 +2,10 @@ package executor
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"github.com/tidwall/gjson"
 )
 
 // TestCursorToolDeclarationInPrompt locks the in-band tool protocol: Cursor has
@@ -75,5 +78,46 @@ func TestBuildOpenAIToolCallResponse(t *testing.T) {
 	}
 	if fn["arguments"] != `{"path":"a.txt"}` {
 		t.Errorf("arguments = %v", fn["arguments"])
+	}
+}
+
+func TestCursorRequestDeclaresTools(t *testing.T) {
+	withTools, _ := json.Marshal(map[string]any{
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{"name": "read_file"}}},
+	})
+	withoutTools, _ := json.Marshal(map[string]any{"messages": []any{}})
+	emptyTools, _ := json.Marshal(map[string]any{"tools": []any{}})
+	if !cursorRequestDeclaresTools(withTools) {
+		t.Fatal("expected tools to be detected")
+	}
+	if cursorRequestDeclaresTools(withoutTools) || cursorRequestDeclaresTools(emptyTools) || cursorRequestDeclaresTools(nil) {
+		t.Fatal("empty/missing tools should not count as declared")
+	}
+}
+
+// TestBuildOpenAIToolCallStreamChunks locks the streaming shape that keeps
+// clients from dropping a tool turn (finish_reason=tool_calls, not stop).
+func TestBuildOpenAIToolCallStreamChunks(t *testing.T) {
+	calls := []cursorToolCall{
+		{Name: "read_file", Arguments: json.RawMessage(`{"path":"a.txt"}`)},
+		{Name: "list_dir", Arguments: json.RawMessage(`{}`)},
+	}
+	chunks := buildOpenAIToolCallStreamChunks("cursor/default", calls)
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d, want 2", len(chunks))
+	}
+	open := strings.TrimPrefix(strings.TrimSpace(string(chunks[0])), "data: ")
+	done := strings.TrimPrefix(strings.TrimSpace(string(chunks[1])), "data: ")
+	if gjson.Get(open, "choices.0.delta.tool_calls.#").Int() != 2 {
+		t.Fatalf("open tool_calls = %s", open)
+	}
+	if gjson.Get(open, "choices.0.delta.tool_calls.0.function.name").String() != "read_file" {
+		t.Fatalf("first tool name missing: %s", open)
+	}
+	if gjson.Get(open, "choices.0.finish_reason").Type != gjson.Null {
+		t.Fatalf("open finish_reason should be null: %s", open)
+	}
+	if gjson.Get(done, "choices.0.finish_reason").String() != "tool_calls" {
+		t.Fatalf("done finish_reason = %s", done)
 	}
 }
