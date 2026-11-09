@@ -43,6 +43,43 @@ func TestCursorNoToolsMeansNoProtocol(t *testing.T) {
 	}
 }
 
+// TestCursorToolContinuationHintAfterResults keeps tool schemas before the
+// transcript and ends with a plain-text continuation cue so Free models stop
+// looping the same tool_calls JSON after results arrive.
+func TestCursorToolContinuationHintAfterResults(t *testing.T) {
+	payload := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "list . then DONE"},
+			map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id": "call_1", "type": "function",
+					"function": map[string]any{"name": "list_dir", "arguments": `{"path":"."}`},
+				}},
+			},
+			map[string]any{"role": "tool", "tool_call_id": "call_1", "name": "list_dir", "content": "a.txt"},
+		},
+		"tools": []any{map[string]any{"type": "function", "function": map[string]any{
+			"name": "list_dir", "description": "List files",
+			"parameters": map[string]any{"type": "object"},
+		}}},
+	}
+	raw, _ := json.Marshal(payload)
+	prompt := cursorPromptFromPayload(raw)
+	toolsAt := strings.Index(prompt, "AVAILABLE TOOLS")
+	userAt := strings.Index(prompt, "User: list . then DONE")
+	hintAt := strings.Index(prompt, "CONTINUE:")
+	if toolsAt < 0 || userAt < 0 || hintAt < 0 {
+		t.Fatalf("missing sections:\n%s", prompt)
+	}
+	if !(toolsAt < userAt && userAt < hintAt) {
+		t.Fatalf("order want tools < transcript < CONTINUE, got tools=%d user=%d hint=%d\n%s", toolsAt, userAt, hintAt, prompt)
+	}
+	if !contains(prompt, `"name":"list_dir"`) {
+		t.Fatalf("assistant tool envelope missing:\n%s", prompt)
+	}
+}
+
 // TestBuildOpenAIToolCallResponse asserts the emitted shape clients expect.
 func TestBuildOpenAIToolCallResponse(t *testing.T) {
 	calls := []cursorToolCall{{Name: "read_file", Arguments: json.RawMessage(`{"path":"a.txt"}`)}}

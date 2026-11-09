@@ -39,8 +39,8 @@ func TestCursorPromptFlattening(t *testing.T) {
 		"You are a coding agent.",
 		"Be concise.",
 		"User: read notes.txt",
-		"tool_call name=read_file",
-		`{"file_path":"notes.txt"}`,
+		`"name":"read_file"`,
+		`"file_path":"notes.txt"`,
 		"Tool result (tool_call_id=call_1 name=read_file):",
 		"hello world",
 	} {

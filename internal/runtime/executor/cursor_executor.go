@@ -426,8 +426,15 @@ You may call the tools listed above. To call a tool, reply with ONE JSON object
 and nothing else:
 {"tool_calls":[{"name":"<tool name>","arguments":{<json arguments>}}]}
 Emit no prose before or after that object, no markdown fences, and exactly one
-entry per tool you need. If no tool is required, answer the user normally.
-When you receive a "Tool result" block, continue the task from it.`
+entry per tool you need. If no tool is required, answer the user in plain text
+(never an empty tool_calls object). Do not repeat a tool call that already has
+a Tool result in the transcript unless you need different arguments.`
+
+// cursorToolContinuationHint is appended when the latest turn is a tool result
+// so the model is not biased toward emitting another tool JSON object.
+const cursorToolContinuationHint = `CONTINUE: Tool results above are already available.
+Write the next assistant reply now. Prefer plain text. Emit a tool_calls JSON
+object only when a new, distinct tool call is still required.`
 
 // cursorToolCall is one parsed tool invocation.
 type cursorToolCall struct {
@@ -483,6 +490,7 @@ func cursorPromptFromPayload(payload []byte) string {
 	}
 	var systemParts []string
 	var turns []string
+	lastRole := ""
 
 	messages.ForEach(func(_, message gjson.Result) bool {
 		role := strings.TrimSpace(message.Get("role").String())
@@ -492,44 +500,85 @@ func cursorPromptFromPayload(payload []byte) string {
 			if content != "" {
 				systemParts = append(systemParts, content)
 			}
+			lastRole = role
 		case "assistant":
 			chunks := make([]string, 0, 3)
 			if content != "" {
 				chunks = append(chunks, content)
 			}
-			message.Get("tool_calls").ForEach(func(_, call gjson.Result) bool {
-				name := call.Get("function.name").String()
-				args := call.Get("function.arguments").String()
-				if args == "" {
-					args = "{}"
-				}
-				chunks = append(chunks, fmt.Sprintf("tool_call name=%s arguments=%s", name, args))
-				return true
-			})
+			if envelope := cursorAssistantToolEnvelope(message); envelope != "" {
+				// Replay prior tool calls in the same JSON shape the protocol
+				// asks the model to emit, so multiturn history stays consistent.
+				chunks = append(chunks, envelope)
+			}
 			if len(chunks) > 0 {
 				turns = append(turns, "Assistant: "+strings.Join(chunks, "\n"))
 			}
+			lastRole = role
 		case "tool", "function":
 			name := message.Get("name").String()
 			callID := message.Get("tool_call_id").String()
 			turns = append(turns, fmt.Sprintf("Tool result (tool_call_id=%s name=%s):\n%s", callID, name, content))
+			lastRole = "tool"
 		default:
 			if content != "" {
 				turns = append(turns, "User: "+content)
 			}
+			lastRole = "user"
 		}
 		return true
 	})
 
-	blocks := make([]string, 0, 3)
+	blocks := make([]string, 0, 4)
 	if len(systemParts) > 0 {
 		blocks = append(blocks, strings.Join(systemParts, "\n\n"))
 	}
-	blocks = append(blocks, turns...)
+	// Keep tool schemas near the system prompt, not after the latest tool
+	// result — trailing "call a tool" text biases Free models into loops.
 	if declaration := cursorToolDeclaration(payload); declaration != "" {
 		blocks = append(blocks, declaration)
 	}
+	blocks = append(blocks, turns...)
+	if lastRole == "tool" && cursorRequestDeclaresTools(payload) {
+		blocks = append(blocks, cursorToolContinuationHint)
+	}
 	return strings.TrimSpace(strings.Join(blocks, "\n\n"))
+}
+
+// cursorAssistantToolEnvelope rebuilds prior assistant tool_calls as the
+// protocol JSON object so history matches what the model is told to emit.
+func cursorAssistantToolEnvelope(message gjson.Result) string {
+	toolCalls := message.Get("tool_calls")
+	if !toolCalls.Exists() || !toolCalls.IsArray() || len(toolCalls.Array()) == 0 {
+		return ""
+	}
+	calls := make([]cursorToolCall, 0, len(toolCalls.Array()))
+	toolCalls.ForEach(func(_, call gjson.Result) bool {
+		name := strings.TrimSpace(call.Get("function.name").String())
+		if name == "" {
+			name = strings.TrimSpace(call.Get("name").String())
+		}
+		if name == "" {
+			return true
+		}
+		args := call.Get("function.arguments").String()
+		if args == "" {
+			args = call.Get("arguments").Raw
+		}
+		if strings.TrimSpace(args) == "" {
+			args = "{}"
+		}
+		calls = append(calls, cursorToolCall{Name: name, Arguments: json.RawMessage(args)})
+		return true
+	})
+	if len(calls) == 0 {
+		return ""
+	}
+	raw, errJSON := json.Marshal(cursorToolEnvelope{ToolCalls: calls})
+	if errJSON != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // cursorRequestDeclaresTools reports whether the OpenAI request carries tools.
