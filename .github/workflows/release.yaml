@@ -185,6 +185,7 @@ jobs:
           fi
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
@@ -321,6 +322,7 @@ jobs:
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
@@ -440,6 +442,7 @@ jobs:
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
@@ -641,6 +644,7 @@ jobs:
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
