@@ -106,6 +106,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: binaries-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
           if-no-files-found: error
