@@ -130,17 +130,17 @@ func patchManagementHTMLForCommandCode(raw []byte) []byte {
 	return []byte(out)
 }
 
-// ensureCommandCodeInProviderSets appends `commandcode` to OAuth/webui provider
-// sets that already list `devin` (or the classic anthropic/claude oauth sets).
+// ensureCommandCodeInProviderSets appends `commandcode` only to OAuth/webui
+// provider sets. Do NOT touch AuthFileQuota registries (nh / xO / PN / SO):
+// Command Code quota is served via the plugin path + builtin-commandcode id.
+// Injecting into those sets makes the panel use quotaType "commandcode", which
+// throws "Unsupported quota type: commandcode" because Xk has no such entry.
 func ensureCommandCodeInProviderSets(out string) string {
 	replacements := [][2]string{
+		// Roe — OAuth login card allow-list (anthropic id form).
 		{"[`codex`,`anthropic`,`antigravity`,`xai`,`devin`]", "[`codex`,`anthropic`,`antigravity`,`xai`,`devin`,`commandcode`]"},
+		// Kte — startAuth is_webui set (claude id form).
 		{"[`codex`,`claude`,`antigravity`,`xai`,`devin`]", "[`codex`,`claude`,`antigravity`,`xai`,`devin`,`commandcode`]"},
-		{"[`antigravity`,`claude`,`codex`,`devin`,`kimi`,`meta`,`xai`]", "[`antigravity`,`claude`,`codex`,`devin`,`kimi`,`meta`,`xai`,`commandcode`]"},
-		{"[`meta`,`antigravity`,`claude`,`codex`,`devin`,`kimi`,`plugin`,`xai`]", "[`meta`,`antigravity`,`claude`,`codex`,`devin`,`kimi`,`plugin`,`xai`,`commandcode`]"},
-		{"[`meta`,`antigravity`,`claude`,`codex`,`kimi`,`xai`]", "[`meta`,`antigravity`,`claude`,`codex`,`kimi`,`xai`,`commandcode`]"},
-		{"[`meta`,`vertex`,`aistudio`,`antigravity`,`xai`,`claude`,`codex`,`devin`,`kimi`]", "[`meta`,`vertex`,`aistudio`,`antigravity`,`xai`,`claude`,`codex`,`devin`,`kimi`,`commandcode`]"},
-		{"[`claude`,`antigravity`,`codex`,`xai`,`kimi`,`devin`,`meta`,`plugin`]", "[`claude`,`antigravity`,`codex`,`xai`,`kimi`,`devin`,`meta`,`plugin`,`commandcode`]"},
 	}
 	for _, pair := range replacements {
 		if strings.Contains(out, pair[0]) && !strings.Contains(out, pair[1]) {

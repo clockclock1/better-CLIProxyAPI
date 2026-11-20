@@ -186,10 +186,21 @@ func TestPatchManagementHTMLAgainstNov2026CPAMC(t *testing.T) {
 		t.Fatal("Nov 2026 CPAMC must receive import route")
 	}
 	if !strings.Contains(out, "[`codex`,`anthropic`,`antigravity`,`xai`,`devin`,`commandcode`]") {
-		t.Fatal("Nov 2026 CPAMC must add commandcode to codex/anthropic oauth set")
+		t.Fatal("Nov 2026 CPAMC must add commandcode to Roe OAuth allow-list")
 	}
-	if !strings.Contains(out, "[`antigravity`,`claude`,`codex`,`devin`,`kimi`,`meta`,`xai`,`commandcode`]") {
-		t.Fatal("Nov 2026 CPAMC must add commandcode to antigravity oauth set")
+	if !strings.Contains(out, "[`codex`,`claude`,`antigravity`,`xai`,`devin`,`commandcode`]") {
+		t.Fatal("Nov 2026 CPAMC must add commandcode to Kte startAuth webui set")
+	}
+	// Quota registries must stay untouched so AuthFileQuota uses plugin + builtin-commandcode.
+	for _, forbidden := range []string{
+		"nh=new Set([`antigravity`,`claude`,`codex`,`devin`,`kimi`,`meta`,`xai`,`commandcode`])",
+		"xO=new Set([`meta`,`antigravity`,`claude`,`codex`,`devin`,`kimi`,`plugin`,`xai`,`commandcode`])",
+		"PN=[`claude`,`antigravity`,`codex`,`xai`,`kimi`,`devin`,`meta`,`plugin`,`commandcode`]",
+		"SO=[`meta`,`vertex`,`aistudio`,`antigravity`,`xai`,`claude`,`codex`,`devin`,`kimi`,`commandcode`]",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("must not inject commandcode into AuthFileQuota registry: %s", forbidden)
+		}
 	}
 	// Non-commandcode branch must keep proxyUrl POST support.
 	if !strings.Contains(out, "proxy_url:") || !strings.Contains(out, "n.proxyUrl?.trim()") {
@@ -198,6 +209,27 @@ func TestPatchManagementHTMLAgainstNov2026CPAMC(t *testing.T) {
 	again := string(patchManagementHTMLForCommandCode([]byte(out)))
 	if again != out {
 		t.Fatal("Nov 2026 patch should be idempotent")
+	}
+}
+
+func TestPatchManagementHTMLDoesNotRegisterCommandCodeQuotaType(t *testing.T) {
+	raw := []byte(strings.Join([]string{
+		"var nh=new Set([`antigravity`,`claude`,`codex`,`devin`,`kimi`,`meta`,`xai`]);",
+		"xO=new Set([`meta`,`antigravity`,`claude`,`codex`,`devin`,`kimi`,`plugin`,`xai`]),",
+		"SO=[`meta`,`vertex`,`aistudio`,`antigravity`,`xai`,`claude`,`codex`,`devin`,`kimi`],",
+		"var PN=[`claude`,`antigravity`,`codex`,`xai`,`kimi`,`devin`,`meta`,`plugin`],",
+		"Roe=new Set([`codex`,`anthropic`,`antigravity`,`xai`,`devin`]),",
+		"Kte=new Set([`codex`,`claude`,`antigravity`,`xai`,`devin`]),",
+	}, ""))
+	out := string(patchManagementHTMLForCommandCode(raw))
+	if !strings.Contains(out, "Roe=new Set([`codex`,`anthropic`,`antigravity`,`xai`,`devin`,`commandcode`])") {
+		t.Fatal("expected OAuth Roe set to include commandcode")
+	}
+	if !strings.Contains(out, "Kte=new Set([`codex`,`claude`,`antigravity`,`xai`,`devin`,`commandcode`])") {
+		t.Fatal("expected OAuth Kte set to include commandcode")
+	}
+	if strings.Contains(out, "`xai`,`commandcode`]") || strings.Contains(out, "`plugin`,`commandcode`]") {
+		t.Fatalf("quota registries must not gain commandcode:\n%s", out)
 	}
 }
 
