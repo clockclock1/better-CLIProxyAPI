@@ -2,9 +2,20 @@ package api
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func managementHTMLPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "static", "management.html")
+}
 
 func TestPatchManagementHTMLForCommandCode(t *testing.T) {
 	cases := []struct {
@@ -148,5 +159,72 @@ func TestPatchManagementHTMLAgainstRealFile(t *testing.T) {
 	}
 	if !strings.Contains(out, "id:`commandcode`") {
 		t.Fatal("real management.html must receive commandcode card")
+	}
+}
+
+func TestPatchManagementHTMLAgainstNov2026CPAMC(t *testing.T) {
+	raw, err := os.ReadFile(managementHTMLPath(t))
+	if err != nil {
+		t.Skip(err)
+	}
+	src := string(raw)
+	if !strings.Contains(src, "signInNoteKey:`auth_login.devin_oauth_hint`") {
+		t.Skip("fixture is not the Nov 2026 CPAMC build with signInNoteKey")
+	}
+	if !strings.Contains(src, "startAuth:(e,t,n={})") {
+		t.Skip("fixture is missing proxy-aware startAuth")
+	}
+
+	out := string(patchManagementHTMLForCommandCode(raw))
+	if !strings.Contains(out, "kind:`builtin`,id:`commandcode`,label:`Command Code`") {
+		t.Fatal("Nov 2026 CPAMC must receive commandcode OAuth card")
+	}
+	if !strings.Contains(out, "cc-apikey-overlay") {
+		t.Fatal("Nov 2026 CPAMC must receive API key overlay")
+	}
+	if !strings.Contains(out, "oauth/import?provider=commandcode") {
+		t.Fatal("Nov 2026 CPAMC must receive import route")
+	}
+	if !strings.Contains(out, "[`codex`,`anthropic`,`antigravity`,`xai`,`devin`,`commandcode`]") {
+		t.Fatal("Nov 2026 CPAMC must add commandcode to codex/anthropic oauth set")
+	}
+	if !strings.Contains(out, "[`antigravity`,`claude`,`codex`,`devin`,`kimi`,`meta`,`xai`,`commandcode`]") {
+		t.Fatal("Nov 2026 CPAMC must add commandcode to antigravity oauth set")
+	}
+	// Non-commandcode branch must keep proxyUrl POST support.
+	if !strings.Contains(out, "proxy_url:") || !strings.Contains(out, "n.proxyUrl?.trim()") {
+		t.Fatal("patched startAuth must preserve proxyUrl POST branch")
+	}
+	again := string(patchManagementHTMLForCommandCode([]byte(out)))
+	if again != out {
+		t.Fatal("Nov 2026 patch should be idempotent")
+	}
+}
+
+func TestPatchManagementHTMLMatchesProxyStartAuth(t *testing.T) {
+	raw := []byte("startAuth:(e,t,n={})=>{let r=fb(e),i={provider:r};Kte.has(r)&&(i.is_webui=!0);let a=n.proxyUrl?.trim();return a?W.post(`/oauth/auth-url`,{...i,proxy_url:a},t?{signal:t}:void 0):W.get(`/oauth/auth-url`,{params:i,...t?{signal:t}:{}})}")
+	out := string(patchManagementHTMLForCommandCode(raw))
+	if !strings.Contains(out, "cc-apikey-overlay") {
+		t.Fatal("expected overlay patch against proxy-aware startAuth")
+	}
+	if !strings.Contains(out, "let r=fb(e)") || !strings.Contains(out, "Kte.has(r)") {
+		t.Fatal("patched startAuth must keep fb/Kte symbols")
+	}
+	if !strings.Contains(out, "W.post(`/oauth/import?provider=commandcode`") {
+		t.Fatal("patched startAuth must call W.post for import")
+	}
+	if !strings.Contains(out, "r===`commandcode`?") {
+		t.Fatal("commandcode branch must key off provider id")
+	}
+	if strings.Contains(out, "startAuth:(e,t,n={})=>{let r=fb(e),i={provider:r};Kte.has(r)&&(i.is_webui=!0);let a=n.proxyUrl?.trim();return a?W.post(`/oauth/auth-url`,{...i,proxy_url:a},t?{signal:t}:void 0):W.get(`/oauth/auth-url`,{params:i,...t?{signal:t}:{}})}") {
+		t.Fatal("unpatched proxy startAuth must not remain")
+	}
+}
+
+func TestPatchManagementHTMLMatchesSignInNoteDevinCard(t *testing.T) {
+	raw := []byte("{kind:`builtin`,id:`xai`,label:`xAI`,titleKey:`auth_login.xai_oauth_title`,icon:{light:pS,dark:mS},flow:`browser`},{kind:`builtin`,id:`devin`,label:`Devin`,titleKey:`auth_login.devin_oauth_title`,icon:{light:sS,dark:cS},flow:`browser`,signInNoteKey:`auth_login.devin_oauth_hint`}]")
+	out := string(patchManagementHTMLForCommandCode(raw))
+	if !strings.Contains(out, "kind:`builtin`,id:`commandcode`,label:`Command Code`,titleKey:`auth_login.commandcode_oauth_title`,icon:{light:sS,dark:cS},flow:`browser`") {
+		t.Fatalf("did not inject commandcode card after signInNoteKey Devin card:\n%s", out)
 	}
 }
