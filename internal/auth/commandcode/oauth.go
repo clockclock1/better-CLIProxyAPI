@@ -26,7 +26,7 @@ const (
 	// DefaultCLIVersion is the bootstrap fallback for x-command-code-version.
 	// Prefer CurrentCLIVersion() / HeaderCLIVersion(), which auto-refresh from npm
 	// (and bump on upgrade_required). Server minVersion is currently 0.18.10.
-	DefaultCLIVersion = "1.91.1"
+	DefaultCLIVersion = "1.93.2"
 
 	oauthTimeout = 5 * time.Minute
 )
