@@ -38,8 +38,9 @@ jobs:
             goarch: amd64
             binary: CLIProxyAPI.exe
             archive: zip
+          # Build arm64 on macos-15-intel to avoid frequent macos-15 (arm) capacity timeouts.
           - target: darwin-arm64
-            runner: macos-15
+            runner: macos-15-intel
             goos: darwin
             goarch: arm64
             binary: CLIProxyAPI
